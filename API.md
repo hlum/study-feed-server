@@ -38,7 +38,7 @@ Rules:
   - `poster` is used for the first part of a series and for big ideas. It needs 3-5 `slides`, and the last slide carries the cliffhanger.
   - `post` is used for concepts and news. It should include `source` when there is a real one.
   - `terminal` is used for hands-on cards. It needs `visual.kind = "terminal"` or `"code"`.
-- **`source`** is optional. Never invent a quote. Omit `source` rather than fabricate one.
+- **`source`:** every news card has one, linking its article: `{ "label", "quote", "url" }` when the quote appears verbatim in the article, otherwise `{ "label": <feed name>, "url" }` with no `quote` key. Lesson cards have `source: null`. Never invent a quote.
 - **`title`** is at most 80 chars. **`body`** is at most 280 chars. **`cliffhanger`** is at most 70 chars.
 - **`quiz`** is required, with exactly 4 options. **`flashcard`** is required.
 - **`deeper`** is null until `/cards/{id}/deeper` fills it with markdown.

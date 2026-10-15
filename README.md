@@ -113,7 +113,8 @@ Article text sits inside `<article>` tags. Any tag-like text inside it is escape
 
 Validation and sanitizing:
 
-- **News sources:** quotes are kept only if they appear verbatim in the article. Lesson cards never carry a source.
+- **News sources:** every news card links its article URL. The quote is kept only if it appears verbatim in the article; otherwise the source is `{label: feed name, url}` with no quote. Lesson cards never carry a source.
+- **Article text:** when a feed summary is thin, ingest fetches the page and keeps only the article body, using trafilatura (no menus, ads or comments).
 - **SVG:** the sanitizer strips scripts, `foreignObject`, `on*` attributes, external hrefs, and `url()` in styles.
 - **Mermaid:** `click` and `%%{init}` lines are removed.
 

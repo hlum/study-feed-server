@@ -16,8 +16,10 @@ import random
 import re
 import sys
 import urllib.request
+from urllib.parse import urlparse
 
 import feedparser
+import trafilatura
 
 from cards import Invalid, quote_is_verbatim, validate_card
 from core import (BATCH_SIZE, BUFFER_TARGET, CLAUDE_MODEL, LOG_DIR, NIGHTLY_CALLS, RARE_RATE, ROOT,
@@ -83,6 +85,7 @@ def candidate_items(con) -> list[dict]:
         except Exception as e:
             log.warning("feed failed, skipping: %s (%s)", feed, e)
             continue
+        feed_name = html_to_text(parsed.feed.get("title", "")) or urlparse(feed).hostname or feed
         fresh = []
         for e in parsed.entries[:15]:
             link = e.get("link")
@@ -92,7 +95,8 @@ def candidate_items(con) -> list[dict]:
             summary = e.get("summary") or ""
             if e.get("content"):
                 summary = max((c.get("value", "") for c in e.content), key=len, default=summary)
-            fresh.append({"url": link, "feed": feed, "title": html_to_text(e.get("title", "")),
+            fresh.append({"url": link, "feed": feed, "feed_name": feed_name[:120],
+                          "title": html_to_text(e.get("title", "")),
                           "text": html_to_text(summary)})
         per_feed.append(fresh)
     out = []
@@ -103,13 +107,23 @@ def candidate_items(con) -> list[dict]:
     return out
 
 
+def extract_article(page: bytes, url: str) -> str | None:
+    """Main article body only (no menus, ads or comments), via trafilatura."""
+    body = trafilatura.extract(page, url=url, include_comments=False, include_images=False,
+                               include_links=False, deduplicate=True)
+    return re.sub(r"\s+", " ", body).strip() if body else None
+
+
 def article_text(item: dict) -> str:
-    """Feed summary, or the page itself when the summary is too thin (e.g. HN links)."""
+    """Feed summary, or the article body itself when the summary is too thin (e.g. HN links)."""
     text = item["text"]
     if len(text) < 400:
         try:
-            page = http_get(item["url"]).decode("utf-8", "replace")
-            text = (text + " " + html_to_text(page)).strip()
+            body = extract_article(http_get(item["url"]), item["url"])
+            if body:
+                text = (text + " " + body).strip()
+            else:
+                log.info("no article body found at %s; using the feed summary", item["url"])
         except Exception as e:
             log.info("could not fetch article %s (%s)", item["url"], e)
     return text[:ARTICLE_CHARS]
@@ -149,6 +163,24 @@ def article_block(n: int, item: dict) -> str:
     feed = defang(item["feed"]).replace('"', "%22")
     return (f'<article n="{n}" url="{url}" feed="{feed}">\n{defang(item["title"])}\n\n'
             f'{defang(item["text"])}\n</article>')
+
+
+def news_source(model_src, item: dict, problems: list) -> dict | None:
+    """Every news card links its article. The model's label and quote are kept only when
+    the quote appears verbatim in the article; otherwise the source is {feed name, url}."""
+    url = item["url"]
+    if not url.startswith(("http://", "https://")):
+        problems.append("no source: article url is not http(s)")
+        return None
+    src = model_src if isinstance(model_src, dict) else {}
+    label, quote = src.get("label"), src.get("quote")
+    if (isinstance(label, str) and 0 < len(label.strip()) <= 120
+            and isinstance(quote, str) and len(quote.strip()) <= 600
+            and quote_is_verbatim(quote, item["title"] + " " + item["text"])):
+        return {"label": label.strip(), "quote": quote.strip(), "url": url}
+    if quote:
+        problems.append("dropped quote: not found verbatim in article")
+    return {"label": item["feed_name"], "url": url}
 
 
 def make_news_cards(con, items: list[dict]) -> list[int]:
@@ -193,19 +225,16 @@ def make_news_cards(con, items: list[dict]) -> list[int]:
                 continue
         item = items[i]
         try:
+            # The server builds the source itself (below), so a bad one never drops the card.
+            model_src = raw.pop("source", None)
+            raw["source"] = None
             raw["series_id"] = raw["part"] = raw["parts_total"] = None
             problems = []
             card = validate_card(raw, problems)
-        except (TypeError, Invalid) as e:
+        except (TypeError, AttributeError, Invalid) as e:
             log_rejected("news", f"{item['url']}: {e}", raw)
             continue
-        if card["source"]:
-            # Never serve an invented quote, and pin the URL to the real article.
-            if quote_is_verbatim(card["source"]["quote"], item["title"] + " " + item["text"]):
-                card["source"]["url"] = item["url"]
-            else:
-                problems.append("dropped source: quote not found verbatim in article")
-                card["source"] = None
+        card["source"] = news_source(model_src, item, problems)
         for p in problems:
             log.info("news card fix: %s", p)
         ids.append(insert_card(con, card, source_ids[i]))

@@ -186,9 +186,11 @@ def validate_card(raw: dict, problems: list | None = None) -> dict:
     if src is None:
         c["source"] = None
     elif isinstance(src, dict):
-        c["source"] = {"label": _str(src.get("label"), "source.label", 120),
-                       "quote": _str(src.get("quote"), "source.quote", 600),
-                       "url": _str(src.get("url"), "source.url", 1000)}
+        # quote is optional: news cards keep {label, url} when no verbatim quote exists.
+        c["source"] = {"label": _str(src.get("label"), "source.label", 120)}
+        if src.get("quote") is not None:
+            c["source"]["quote"] = _str(src.get("quote"), "source.quote", 600)
+        c["source"]["url"] = _str(src.get("url"), "source.url", 1000)
         if not c["source"]["url"].startswith(("http://", "https://")):
             raise Invalid("source.url must be http(s)")
     else:
