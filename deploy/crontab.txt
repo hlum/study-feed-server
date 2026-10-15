@@ -1,0 +1,3 @@
+# Study Feed ingest (see README.md)
+0 3 * * * cd /home/h/server-setup && .venv/bin/python ingest.py --nightly >> logs/ingest.log 2>&1
+0 */4 * * * cd /home/h/server-setup && .venv/bin/python ingest.py --topup >> logs/ingest.log 2>&1

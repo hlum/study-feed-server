@@ -1,0 +1,31 @@
+# Study Feed - API for the Study Feed iPhone app (card generation via `claude -p`).
+# App code, DB and .env live in /home/h/server-setup (live-mounted at /app): edit there, then Restart here.
+# Tailscale only: host networking + run.sh binds 100.65.4.50 (never 0.0.0.0), waiting for it at boot.
+# The `claude` CLI is the host's own install, mounted read-only, so it follows host updates.
+# Ingest runs from the host crontab (see /home/h/server-setup/README.md).
+services:
+  study-feed:
+    build:
+      context: .
+    image: local/study-feed
+    container_name: study-feed
+    restart: unless-stopped
+    # Homepage tile - edit these to change how it shows on the dashboard
+    labels:
+      homepage.group: "Learning"
+      homepage.name: "Study Feed API"
+      homepage.icon: "mdi-school"
+      homepage.href: "http://100.65.4.50:8001/docs"
+      homepage.description: "IT lesson feed backend (app URL :8001)"
+    user: "1000:1000"
+    network_mode: host
+    environment:
+      TAILSCALE_IP: "100.65.4.50"
+      HOME: /claude-home
+      PATH: /home/h/.local/bin:/usr/local/bin:/usr/bin:/bin
+    volumes:
+      - /home/h/server-setup:/app
+      - ./claude-home:/claude-home
+      - /home/h/.local/bin:/home/h/.local/bin:ro
+      - /home/h/.local/share/claude:/home/h/.local/share/claude:ro
+      - /etc/localtime:/etc/localtime:ro

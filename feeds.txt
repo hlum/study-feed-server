@@ -1,0 +1,25 @@
+# One RSS/Atom URL per line. Lines starting with # are ignored.
+# The owner edits this list. Ingest skips feeds that fail and logs them.
+
+# General tech
+https://hnrss.org/frontpage?points=150
+https://lobste.rs/rss
+
+# Security
+https://krebsonsecurity.com/feed/
+https://www.schneier.com/feed/atom/
+https://portswigger.net/research/rss
+
+# Networking / infra
+https://blog.cloudflare.com/rss/
+https://tailscale.com/blog/index.xml
+
+# AI / ML
+https://export.arxiv.org/rss/cs.CL
+https://huggingface.co/blog/feed.xml
+https://simonwillison.net/atom/everything/
+
+# Software engineering
+https://jvns.ca/atom.xml
+https://danluu.com/atom.xml
+https://github.blog/engineering/feed/
