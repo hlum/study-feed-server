@@ -1,6 +1,7 @@
 """Card validation against the API.md schema, plus SVG/Mermaid sanitizing."""
 import re
 import xml.etree.ElementTree as ET
+from difflib import SequenceMatcher
 
 from core import TOPICS, is_japanese
 
@@ -239,7 +240,7 @@ def validate_card(raw: dict, problems: list | None = None, lang: str = "en") -> 
         raise Invalid("quiz needs exactly 4 options")
     c["quiz"] = {"question": _str(q.get("question"), "quiz.question", lim["question"]),
                  "options": [_str(o, "quiz.option", lim["option"]) for o in options],
-                 "answer": _int(q.get("answer"), "quiz.answer"),
+                 "answer": _answer_index(q.get("answer"), options),
                  "explanation": _str(q.get("explanation"), "quiz.explanation", lim["explanation"])}
     if not 0 <= c["quiz"]["answer"] <= 3:
         raise Invalid("quiz.answer must be 0-3")
@@ -257,6 +258,110 @@ def validate_card(raw: dict, problems: list | None = None, lang: str = "en") -> 
         if not_ja:
             raise Invalid("card for a Japanese article is not in Japanese: " + ", ".join(not_ja))
     return c
+
+
+def _answer_index(answer, options) -> int:
+    """The answer as an option index. Accepts the option's own text when it matches exactly
+    one option; anything else that isn't among the options is rejected."""
+    if isinstance(answer, str):
+        hits = [i for i, o in enumerate(options) if isinstance(o, str) and _norm(o) == _norm(answer)]
+        if len(hits) == 1:
+            return hits[0]
+        if answer.strip().isdigit():
+            return int(answer.strip())
+        raise Invalid("quiz.answer is not among the options")
+    return _int(answer, "quiz.answer")
+
+
+# ---------- limits: report, then shorten ----------
+
+def _limited_fields(raw: dict, lang: str):
+    """(name, path, text, max) for every length-limited text field in a raw card;
+    path walks from the card to the field, e.g. ("quiz", "options", 2)."""
+    lim = LIMITS[lang]
+    paths = [(("title",), "title"), (("body",), "body"), (("cliffhanger",), "cliffhanger"),
+             (("quiz", "question"), "question"), (("quiz", "explanation"), "explanation"),
+             (("flashcard", "front"), "front"), (("flashcard", "back"), "back")]
+    if raw.get("card_type") == "poster" and isinstance(raw.get("slides"), list):
+        for i in range(len(raw["slides"])):
+            paths += [(("slides", i, "title"), "title"), (("slides", i, "body"), "body")]
+    q = raw.get("quiz")
+    if isinstance(q, dict) and isinstance(q.get("options"), list):
+        paths += [(("quiz", "options", i), "option") for i in range(len(q["options"]))]
+    out = []
+    for path, limit_key in paths:
+        node = raw
+        for step in path:
+            ok = (isinstance(node, dict) and step in node) or (isinstance(node, list) and isinstance(step, int))
+            node = node[step] if ok else None
+            if node is None:
+                break
+        if isinstance(node, str):
+            name = ".".join(f"[{p}]" if isinstance(p, int) else p for p in path).replace(".[", "[")
+            out.append((name, path, node, lim[limit_key]))
+    return out
+
+
+def length_problems(raw, lang: str) -> list[str]:
+    """Every over-limit field, worded for the retry prompt, e.g.
+    'body was 286 chars, max 280. Rewrite it shorter.'"""
+    if not isinstance(raw, dict):
+        return []
+    return [f"{n} was {len(t.strip())} chars, max {m}. Rewrite it shorter."
+            for n, _, t, m in _limited_fields(raw, lang) if len(t.strip()) > m]
+
+
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+|(?<=[。！？])")
+
+
+def shorten_text(text: str, max_len: int) -> str | None:
+    """Keep whole sentences up to max_len. None if not even the first sentence fits."""
+    out = ""
+    for sentence in (p.strip() for p in _SENTENCE_END.split(text.strip()) if p.strip()):
+        candidate = out + (" " if out and not out.endswith(("。", "！", "？")) else "") + sentence
+        if len(candidate) > max_len:
+            break
+        out = candidate
+    return out or None
+
+
+def shorten_card(raw: dict, lang: str) -> dict | None:
+    """Shorten every over-limit field at a sentence boundary. None if any field can't be
+    shortened that way (e.g. a one-sentence title), which makes the card unusable."""
+    import copy
+    card = copy.deepcopy(raw)
+    for _, path, text, max_len in _limited_fields(card, lang):
+        if len(text.strip()) <= max_len:
+            continue
+        short = shorten_text(text, max_len)
+        if short is None:
+            return None
+        node = card
+        for step in path[:-1]:
+            node = node[step]
+        node[path[-1]] = short
+    return card
+
+
+# ---------- quality guard (small models) ----------
+
+def _plain(s: str) -> str:
+    return re.sub(r"[\W_]+", "", s.lower())
+
+
+def quality_problems(card: dict) -> list[str]:
+    """Problems that pass the schema but make a bad card."""
+    out = []
+    t, b = _plain(card["title"]), _plain(card["body"])
+    if (b == t or b in t or (b.startswith(t) and len(b) - len(t) < 12)
+            or SequenceMatcher(None, t, b).ratio() >= 0.85):
+        out.append("body only repeats the title")
+    opts = [_plain(o) for o in card["quiz"]["options"]]
+    if len(set(opts)) < len(opts):
+        out.append("quiz has duplicate options")
+    if not 0 <= card["quiz"]["answer"] < len(opts):
+        out.append("quiz answer is not among the options")
+    return out
 
 
 def _norm(s: str) -> str:

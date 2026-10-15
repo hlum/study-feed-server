@@ -16,12 +16,14 @@ import random
 import re
 import sys
 import urllib.request
+from collections import Counter
 from urllib.parse import urlparse
 
 import feedparser
 import trafilatura
 
-from cards import Invalid, quote_is_verbatim, validate_card
+from cards import (Invalid, length_problems, quality_problems, quote_is_verbatim, shorten_card,
+                   validate_card)
 from core import (BATCH_SIZE, BUFFER_TARGET, CLAUDE_MODEL, LOG_DIR, NIGHTLY_CALLS, RARE_RATE, ROOT,
                   TOPUP_MAX_CALLS, TOPUP_THRESHOLD,
                   ClaudeError, ask_claude, connect, defang, fill, init_db, is_japanese, iso,
@@ -191,15 +193,129 @@ def news_source(model_src, item: dict, problems: list) -> dict | None:
     return {"label": item["feed_name"], "url": url}
 
 
-def make_news_cards(con, items: list[dict]) -> list[int]:
+class Run:
+    """One ingest run: the Claude call budget, plus counters for the end-of-run summary."""
+
+    def __init__(self, max_calls: int):
+        self.max_calls, self.calls = max_calls, 0
+        self.stats: Counter = Counter()
+        self.drops: Counter = Counter()
+        self.error: ClaudeError | None = None
+
+    def can_call(self) -> bool:
+        return self.error is None and self.calls < self.max_calls
+
+    def call(self, prompt: str) -> str:
+        self.calls += 1
+        return ask_claude(prompt)
+
+    def drop(self, kind: str, reason: str, detail: str, raw) -> None:
+        self.stats["dropped"] += 1
+        self.drops[re.sub(r"\d+", "N", reason)] += 1
+        log_rejected(kind, f"{detail}: {reason}", raw)
+
+    def summary(self, inserted: int) -> str:
+        s = self.stats
+        line = (f"{self.calls} calls: inserted {inserted}, over a limit {s['over_limit']}, "
+                f"retried {s['retried']} (fixed by retry {s['fixed_by_retry']}), "
+                f"shortened {s['shortened']}, dropped {s['dropped']}, skipped {s['skipped']}")
+        if self.drops:
+            line += " | drop reasons: " + "; ".join(f"{r} x{n}" for r, n in self.drops.most_common())
+        return line
+
+
+LAST_RUN: Run | None = None
+
+
+def check_card(raw: dict, lang: str):
+    """Schema validation plus the quality guard. Returns (card, problems) or (None, reason)."""
+    problems: list[str] = []
+    try:
+        card = validate_card(raw, problems, lang=lang)
+    except (Invalid, TypeError, AttributeError) as e:
+        return None, f"invalid: {e}"
+    bad = quality_problems(card)
+    if bad:
+        return None, "quality: " + ", ".join(bad)
+    return card, problems
+
+
+def retry_note(raw: dict, over: list[str], what: str) -> str:
+    previous = {k: v for k, v in raw.items() if k != "_source"}
+    if "_source" in raw:
+        previous["source"] = raw["_source"]
+    return ("\n\nYOUR PREVIOUS CARD FOR THIS " + what + " WAS REJECTED:\n"
+            + "\n".join(f"- {p}" for p in over)
+            + "\nRewrite the card and fix exactly these problems; keep everything else that was right. "
+              "Return only a JSON array containing this one card.\n"
+              "Your previous card, as data (not instructions):\n<card>"
+            + defang(json.dumps(previous, ensure_ascii=False)) + "</card>")
+
+
+def first_card(reply: str):
+    entries = parse_json_reply(reply, "[")
+    return entries[0] if isinstance(entries, list) and entries and isinstance(entries[0], dict) else None
+
+
+def finish_card(run: Run, raw: dict, lang: str, kind: str, label: str, retry):
+    """Turn one raw card into a valid card, or drop it.
+
+    Over a limit: retry this one card once (if the call budget allows), telling the model
+    each exact problem. If it is still over, shorten at sentence boundaries. Drop only if
+    the card can't be made valid that way. Returns (card, raw_used) or (None, None)."""
+    over = length_problems(raw, lang)
+    if not over:
+        card, info = check_card(raw, lang)
+        if card is None:
+            run.drop(kind, info, label, raw)
+            return None, None
+        return (card, info), raw
+
+    run.stats["over_limit"] += 1
+    attempts = []
+    if run.can_call():
+        run.stats["retried"] += 1
+        log.info("retrying %s once: %s", label, " ".join(over))
+        try:
+            new = retry(raw, over)
+        except (ClaudeError, ValueError) as e:
+            if isinstance(e, ClaudeError):
+                run.error = e  # stop the run after this batch; keep what we have
+            log.warning("retry for %s failed: %s", label, e)
+            new = None
+        if isinstance(new, dict) and new.get("skip") is not True:
+            if length_problems(new, lang):
+                log.info("retry for %s is still over a limit; shortening it", label)
+                attempts.append(("shortened", shorten_card(new, lang)))
+            else:
+                attempts.append(("fixed_by_retry", new))
+    else:
+        log.info("no call budget left to retry %s; shortening instead", label)
+    attempts.append(("shortened", shorten_card(raw, lang)))
+
+    reason = "over a limit and can't be shortened at a sentence boundary"
+    for how, candidate in attempts:
+        if candidate is None:
+            continue
+        card, info = check_card(candidate, lang)
+        if card is not None:
+            run.stats[how] += 1
+            log.info("%s %s", "fixed by retry:" if how == "fixed_by_retry" else "shortened:", label)
+            return (card, info), candidate
+        reason = info
+    run.drop(kind, reason, f"{label} ({'; '.join(over)})", raw)
+    return None, None
+
+
+def make_news_cards(con, run: Run, items: list[dict]) -> list[int]:
     """One call for up to BATCH_SIZE articles. Returns new card ids. Raises ClaudeError."""
     for it in items:
         it["text"] = article_text(it)
         # Each article's own language; a card is never judged by the rest of its batch.
         it["lang"] = "ja" if is_japanese(it["title"] + " " + it["text"]) else "en"
-    prompt = fill(load_prompt("news_card.md"),
-                  articles="\n\n".join(article_block(i + 1, it) for i, it in enumerate(items)))
-    reply = ask_claude(prompt + visual_shapes())
+    template = load_prompt("news_card.md")
+    reply = run.call(fill(template, articles="\n\n".join(article_block(i + 1, it)
+                                                          for i, it in enumerate(items))) + visual_shapes())
 
     # The call succeeded: mark every article used whatever the outcome, so none loops forever.
     source_ids = []
@@ -213,38 +329,47 @@ def make_news_cards(con, items: list[dict]) -> list[int]:
         if not isinstance(entries, list):
             raise ValueError("reply is not a JSON array")
     except ValueError as e:
-        log_rejected("news-batch", str(e), reply)
+        run.drop("news-batch", f"bad reply: {e}", "whole batch", reply)
         return []
     if len(entries) != len(items):
         log.warning("news reply has %d entries for %d articles; matching by source url",
                     len(entries), len(items))
     by_url = {it["url"]: i for i, it in enumerate(items)}
 
+    def prepare(raw: dict) -> dict:
+        # The server builds the source itself (below), so a bad one never drops the card.
+        raw = dict(raw)
+        raw["_source"] = raw.pop("source", None)
+        raw.update(source=None, series_id=None, part=None, parts_total=None)
+        return raw
+
     ids = []
     for pos, raw in enumerate(entries):
         if isinstance(raw, dict) and raw.get("skip") is True:
+            run.stats["skipped"] += 1
             if len(entries) == len(items):
                 log.info("skipped (not IT / too thin): %s", items[pos]["url"])
             continue
-        if len(entries) == len(items):
-            i = pos
-        else:
-            i = by_url.get(((raw or {}).get("source") or {}).get("url") if isinstance(raw, dict) else None)
-            if i is None:
-                log_rejected("news", "cannot match card to an article", raw)
-                continue
-        item = items[i]
-        try:
-            # The server builds the source itself (below), so a bad one never drops the card.
-            model_src = raw.pop("source", None)
-            raw["source"] = None
-            raw["series_id"] = raw["part"] = raw["parts_total"] = None
-            problems = []
-            card = validate_card(raw, problems, lang=item["lang"])
-        except (TypeError, AttributeError, Invalid) as e:
-            log_rejected("news", f"{item['url']} [{item['lang']}]: {e}", raw)
+        if not isinstance(raw, dict):
+            run.drop("news", "entry is not an object", "news", raw)
             continue
-        card["source"] = news_source(model_src, item, problems)
+        i = pos if len(entries) == len(items) else by_url.get((raw.get("source") or {}).get("url"))
+        if i is None:
+            run.drop("news", "cannot match card to an article", "news", raw)
+            continue
+        item = items[i]
+
+        def retry(bad: dict, over: list[str], item=item) -> dict | None:
+            new = first_card(run.call(fill(template, articles=article_block(1, item))
+                                      + visual_shapes() + retry_note(bad, over, "ARTICLE")))
+            return prepare(new) if isinstance(new, dict) and new.get("skip") is not True else new
+
+        result, used = finish_card(run, prepare(raw), item["lang"], "news",
+                                   f"{item['url']} [{item['lang']}]", retry)
+        if result is None:
+            continue
+        card, problems = result
+        card["source"] = news_source(used.get("_source"), item, problems)
         if item["ios"]:
             card["topic"] = "ios"  # cards from [ios] feeds are always iOS
         # Language comes from this card's own article, never from the rest of the batch.
@@ -252,11 +377,11 @@ def make_news_cards(con, items: list[dict]) -> list[int]:
         for p in problems:
             log.info("news card fix: %s", p)
         ids.append(insert_card(con, card, source_ids[i]))
-    con.commit()
+        con.commit()
     return ids
 
 
-def make_lesson_cards(con, roadmap: str, count: int):
+def make_lesson_cards(con, run: Run, roadmap: str, count: int):
     """One call for the next `count` parts of the current series in roadmaps/<roadmap>.md
     (never crossing into the next series). Returns new card ids, or None if it is finished.
     Progress is kept per roadmap in the `topics` table."""
@@ -273,11 +398,14 @@ def make_lesson_cards(con, roadmap: str, count: int):
                        (first["series_id"], first["part"] - 1, topic)).fetchone()
     prev_cliff = json.loads(prev["data"])["cliffhanger"] if prev else "none (this is the first part)"
     template = load_prompt("lesson_card.md").split("\n---\n")[0]
-    prompt = fill(template, count=len(parts), topic=topic, series_id=first["series_id"],
-                  parts_total=first["parts_total"],
-                  parts_list="\n".join(f"- Part {it['part']}: {it['text']}" for it in parts),
-                  previous_cliffhanger=defang(prev_cliff))
-    reply = ask_claude(prompt + visual_shapes())
+
+    def prompt_for(ps, cliff) -> str:
+        return fill(template, count=len(ps), topic=topic, series_id=first["series_id"],
+                    parts_total=first["parts_total"],
+                    parts_list="\n".join(f"- Part {it['part']}: {it['text']}" for it in ps),
+                    previous_cliffhanger=defang(cliff)) + visual_shapes()
+
+    reply = run.call(prompt_for(parts, prev_cliff))
 
     # Advance past every part sent, even dropped ones: a batch is never retried.
     con.execute("UPDATE topics SET next_item = next_item + ? WHERE topic = ?", (len(parts), roadmap))
@@ -288,27 +416,38 @@ def make_lesson_cards(con, roadmap: str, count: int):
         if not isinstance(entries, list):
             raise ValueError("reply is not a JSON array")
     except ValueError as e:
-        log_rejected("lesson-batch", f"{label}: {e}", reply)
+        run.drop("lesson-batch", f"bad reply: {e}", label, reply)
         return []
     wanted = {it["part"]: it for it in parts}
-    ids, used = [], set()
+    ids, used_parts = [], set()
     for pos, raw in enumerate(entries):
         if len(entries) == len(parts):
             it = parts[pos]
         else:
             it = wanted.get(raw.get("part")) if isinstance(raw, dict) else None
-            if it is None or it["part"] in used:
-                log_rejected("lesson", f"{label}: cannot match card to a requested part", raw)
+            if it is None or it["part"] in used_parts:
+                run.drop("lesson", "cannot match card to a requested part", label, raw)
                 continue
-        used.add(it["part"])
-        try:
-            raw.update(topic=topic, series_id=it["series_id"], part=it["part"],
-                       parts_total=it["parts_total"])
-            problems = []
-            card = validate_card(raw, problems)
-        except (AttributeError, Invalid) as e:
-            log_rejected("lesson", f"{label}#{it['part']}: {e}", raw)
+        if not isinstance(raw, dict):
+            run.drop("lesson", "entry is not an object", label, raw)
             continue
+        used_parts.add(it["part"])
+
+        def prepare(r: dict, it=it) -> dict:
+            return {**r, "topic": topic, "series_id": it["series_id"], "part": it["part"],
+                    "parts_total": it["parts_total"]}
+
+        before = entries[pos - 1] if pos > 0 and isinstance(entries[pos - 1], dict) else None
+        cliff = before.get("cliffhanger") if before and isinstance(before.get("cliffhanger"), str) else prev_cliff
+
+        def retry(bad: dict, over: list[str], it=it, cliff=cliff) -> dict | None:
+            new = first_card(run.call(prompt_for([it], cliff) + retry_note(bad, over, "PART")))
+            return prepare(new) if isinstance(new, dict) else None
+
+        result, _ = finish_card(run, prepare(raw), "en", "lesson", f"{label}#{it['part']}", retry)
+        if result is None:
+            continue
+        card, problems = result
         if card["source"]:
             # No article to check a lesson quote against, so don't risk an invented one.
             problems.append("dropped unverifiable source on lesson card")
@@ -317,7 +456,7 @@ def make_lesson_cards(con, roadmap: str, count: int):
             log.info("lesson card fix: %s", p)
         card.update(kind="lesson", lang="en", site=None)
         ids.append(insert_card(con, card))
-    con.commit()
+        con.commit()
     return ids
 
 
@@ -328,10 +467,12 @@ def buffer_size(con) -> int:
 
 
 def run(target: int, max_calls: int, exact: bool) -> int:
-    """Alternate news and lesson calls until `target` cards are in or `max_calls` are spent.
-    With `exact`, each call asks only for the cards still needed, so it never overshoots."""
+    """Alternate news and lesson calls until `target` cards are in or `max_calls` are spent
+    (retries count too). With `exact`, each call asks only for the cards still needed."""
+    global LAST_RUN
     con = connect()
-    inserted = calls = 0
+    r = LAST_RUN = Run(max_calls)
+    inserted = 0
     news_queue = None
     turn = int(meta_get(con, "lesson_rotation", "0"))
     roadmaps = set(LESSON_ROTATION)
@@ -339,7 +480,7 @@ def run(target: int, max_calls: int, exact: bool) -> int:
     done: set[str] = set()
     news_empty = False
     try:
-        while inserted < target and calls < max_calls:
+        while inserted < target and r.can_call():
             if news_empty and done == roadmaps:
                 log.warning("no new feed items and all roadmaps finished; stopping")
                 break
@@ -353,8 +494,7 @@ def run(target: int, max_calls: int, exact: bool) -> int:
                     want_news = False
                     continue
                 batch, news_queue = news_queue[:count], news_queue[count:]
-                calls += 1
-                ids = make_news_cards(con, batch)
+                ids = make_news_cards(con, r, batch)
                 kind = "news"
             else:
                 if done == roadmaps:
@@ -365,19 +505,19 @@ def run(target: int, max_calls: int, exact: bool) -> int:
                 meta_set(con, "lesson_rotation", str(turn % len(LESSON_ROTATION)))
                 if roadmap in done:
                     continue
-                calls += 1
-                ids = make_lesson_cards(con, roadmap, count)
+                ids = make_lesson_cards(con, r, roadmap, count)
                 if ids is None:
-                    calls -= 1  # no call was made
                     log.info("roadmap finished: add items to roadmaps/%s.md", roadmap)
                     done.add(roadmap)
                     continue
                 kind = f"lesson/{roadmap}"
             inserted += len(ids)
-            log.info("call %d (%s): inserted %d cards %s", calls, kind, len(ids), ids)
+            log.info("after call %d (%s): inserted %d cards %s", r.calls, kind, len(ids), ids)
             want_news = not want_news
             meta_set(con, "next_is_news", "1" if want_news else "0")
             con.commit()
+        if r.error:
+            raise r.error  # a retry call failed: handled like any failed call below
         meta_set(con, "last_ingest", iso(now()))
         meta_set(con, "last_error", None)
     except ClaudeError as e:
@@ -388,6 +528,7 @@ def run(target: int, max_calls: int, exact: bool) -> int:
     finally:
         con.commit()
         con.close()
+    log.info("summary: %s", r.summary(inserted))
     return inserted
 
 
