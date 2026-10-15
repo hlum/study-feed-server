@@ -110,7 +110,7 @@ def feed(cursor: int | None = None, limit: int = Query(10, ge=1, le=50)):
                 "WHERE c.seen_at IS NOT NULL "
                 "AND NOT EXISTS (SELECT 1 FROM reactions x WHERE x.card_id = c.id AND x.kind = 'got_it') "
                 "AND NOT (COALESCE(r.interval_d, 0) >= 21) "
-                "AND NOT (a.correct = 1 AND r.card_id IS NULL) "
+                "AND NOT (COALESCE(a.correct, 0) = 1 AND r.card_id IS NULL) "
                 f"AND c.id NOT IN ({ph}) ORDER BY c.seen_at LIMIT ?",
                 (*used, limit - len(out))).fetchall()
             for r in rows:
