@@ -22,6 +22,9 @@ from core import (TOPICS, ClaudeError, ask_claude, claude_args, claude_env, conn
 log = logging.getLogger("studyfeed.app")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 FLASHCARD_MSG = "Make it a flashcard"
+# Confirmation prefixes; also used to spot a flashcard already saved from a thread.
+FLASHCARD_SAVED = {"en": "Saved as a flashcard (card {id}).", "ja": "フラッシュカードに保存しました（カード {id}）。"}
+FLASHCARD_SAVED_RE = re.compile(r"^(?:Saved as a flashcard \(card (\d+)\)\.|フラッシュカードに保存しました（カード (\d+)）。)")
 
 
 @asynccontextmanager
@@ -390,6 +393,22 @@ def make_flashcard_card(con, parent_id: int, parent: dict, fc: dict) -> int:
     return cur.lastrowid
 
 
+_flashcard_locks: dict[int, asyncio.Lock] = {}
+
+
+def saved_flashcard_reply(card_id: int) -> str | None:
+    """The latest confirmation for a flashcard saved from this card's thread, if that
+    flashcard card still exists."""
+    with db() as con:
+        for m in con.execute("SELECT text FROM messages WHERE card_id = ? AND role = 'assistant' "
+                             "ORDER BY id DESC", (card_id,)):
+            match = FLASHCARD_SAVED_RE.match(m["text"])
+            if match and con.execute("SELECT 1 FROM cards WHERE id = ?",
+                                     (int(match.group(1) or match.group(2)),)).fetchone():
+                return m["text"]
+    return None
+
+
 @app.post("/ask")
 async def ask(body: AskIn):
     message = body.message.strip()
@@ -415,20 +434,26 @@ async def ask(body: AskIn):
 
     if message == FLASHCARD_MSG:
         async def flashcard_stream():
-            try:
-                reply = await asyncio.to_thread(ask_claude, prompt)
-                fc = parse_json_reply(reply)
-                with db() as con:
-                    new_id = make_flashcard_card(con, body.card_id, card, fc)
-                text = (f"フラッシュカードに保存しました（カード {new_id}）。明日の復習に出てきます。\n\n"
-                        f"表: {fc['front']}\n裏: {fc['back']}" if ja else
-                        f"Saved as a flashcard (card {new_id}). It shows up in Review tomorrow.\n\n"
-                        f"Front: {fc['front']}\nBack: {fc['back']}")
-            except (ClaudeError, ValueError, KeyError, TypeError) as e:
-                log.error("flashcard failed: %s", e)
-                text = ("すみません、今はフラッシュカードを作れませんでした。しばらくしてからもう一度お試しください。"
-                        if ja else "Sorry, I couldn't make a flashcard right now. Try again later.")
-            store_reply(text)
+            # One flashcard per thread: a lock stops a double tap from making two.
+            async with _flashcard_locks.setdefault(body.card_id, asyncio.Lock()):
+                existing = saved_flashcard_reply(body.card_id)
+                if existing:
+                    text = existing  # already saved: repeat its confirmation, no Claude call
+                else:
+                    try:
+                        reply = await asyncio.to_thread(ask_claude, prompt)
+                        fc = parse_json_reply(reply)
+                        with db() as con:
+                            new_id = make_flashcard_card(con, body.card_id, card, fc)
+                        saved = FLASHCARD_SAVED["ja" if ja else "en"].format(id=new_id)
+                        text = (f"{saved}明日の復習に出てきます。\n\n表: {fc['front']}\n裏: {fc['back']}" if ja else
+                                f"{saved} It shows up in Review tomorrow.\n\n"
+                                f"Front: {fc['front']}\nBack: {fc['back']}")
+                    except (ClaudeError, ValueError, KeyError, TypeError) as e:
+                        log.error("flashcard failed: %s", e)
+                        text = ("すみません、今はフラッシュカードを作れませんでした。しばらくしてからもう一度お試しください。"
+                                if ja else "Sorry, I couldn't make a flashcard right now. Try again later.")
+                store_reply(text)
             yield sse("token", {"text": text})
             yield sse("suggestions", [])
             yield sse("done", {})

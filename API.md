@@ -126,7 +126,7 @@ Returns an SSE stream:
 - then `event: done`.
 
 The server stores both messages in `messages`. Context sent to Claude is the card JSON plus the last 10 messages, using `prompts/ask.md`.
-If the user taps "Make it a flashcard", the app sends that text as a message. The server creates a new review card from the conversation and replies with a confirmation.
+If the user taps "Make it a flashcard", the app sends that text as a message. The server creates a new review card from the conversation and replies with a confirmation. Each thread makes at most one flashcard: if this card's thread already has one, the server repeats its confirmation without calling Claude again.
 
 ### `GET /stats`
 Returns:
