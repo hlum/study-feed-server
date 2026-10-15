@@ -74,6 +74,12 @@ If a call fails or hits a Pro usage limit, the run stops and records the error i
 
 Each card in a reply is validated on its own: bad cards are logged and dropped, and good ones are kept. Lesson parts that get dropped are not retried. When a roadmap file is finished, ingest logs it, and you can add more items to `roadmaps/<topic>.md`.
 
+## Content sources
+
+- **News:** `feeds.txt` holds one RSS/Atom URL per line. It covers general tech, security, AI, iOS/Swift, Qiita, Zenn, and Japanese company tech blogs. Each run shuffles the feed order, so every feed gets a turn. When a summary is thin (Qiita summaries, for example), the article body is fetched with trafilatura. Cards are written in English, including for Japanese articles.
+- **Lessons:** `roadmaps/*.md`. Lesson calls rotate `networking → ios → security → swe → ai → ios` (`LESSON_ROTATION` in `ingest.py`), so iOS gets a third of all lessons. `topic` is limited to the four values in `API.md`, so iOS cards use `topic: "swe"`. Progress per roadmap is kept in the `topics` table.
+- **X/Twitter:** not supported. There's no free feed, the API is paid, and scraping breaks X's terms. To follow particular people, add their blog, newsletter, or a Bluesky profile feed (`https://bsky.app/profile/<handle>/rss`) to `feeds.txt`.
+
 ## Configuration (`.env`)
 
 | Key | Meaning |

@@ -23,3 +23,37 @@ https://simonwillison.net/atom/everything/
 https://jvns.ca/atom.xml
 https://danluu.com/atom.xml
 https://github.blog/engineering/feed/
+
+# iOS / Swift
+https://developer.apple.com/news/rss/news.rss
+https://www.swiftbysundell.com/rss
+https://www.hackingwithswift.com/articles/rss
+https://www.avanderlee.com/feed/
+https://www.donnywals.com/feed/
+https://nshipster.com/feed.xml
+https://useyourloaf.com/blog/rss.xml
+https://iosdevweekly.com/issues.rss
+https://sarunw.com/feed.xml
+https://www.polpiella.dev/rss.xml
+
+# Japanese: Qiita (popular + iOS tags)
+https://qiita.com/popular-items/feed
+https://qiita.com/tags/swift/feed
+https://qiita.com/tags/ios/feed
+https://qiita.com/tags/swiftui/feed
+
+# Japanese: Zenn (trending + iOS topics)
+https://zenn.dev/feed
+https://zenn.dev/topics/swift/feed
+https://zenn.dev/topics/ios/feed
+https://zenn.dev/topics/swiftui/feed
+
+# Japanese: news and company tech blogs
+https://b.hatena.ne.jp/hotentry/it.rss
+https://www.publickey1.jp/atom.xml
+https://gihyo.jp/feed/rss2
+https://techlife.cookpad.com/feed
+https://engineering.mercari.com/blog/feed.xml
+https://techblog.lycorp.co.jp/ja/feed/index.xml
+https://developers.cyberagent.co.jp/blog/feed/
+https://engineering.dena.com/index.xml

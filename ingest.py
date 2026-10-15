@@ -23,7 +23,7 @@ import trafilatura
 
 from cards import Invalid, quote_is_verbatim, validate_card
 from core import (BATCH_SIZE, BUFFER_TARGET, CLAUDE_MODEL, LOG_DIR, NIGHTLY_CALLS, RARE_RATE, ROOT,
-                  TOPICS, TOPUP_MAX_CALLS, TOPUP_THRESHOLD,
+                  TOPUP_MAX_CALLS, TOPUP_THRESHOLD,
                   ClaudeError, ask_claude, connect, defang, fill, init_db, iso, load_prompt,
                   meta_get, meta_set, now, parse_json_reply)
 
@@ -31,6 +31,13 @@ log = logging.getLogger("studyfeed.ingest")
 UA = "StudyFeed/1.0 (personal RSS reader)"
 MAX_BYTES = 2_000_000
 ARTICLE_CHARS = 4000  # per article; 5 articles share one prompt
+
+# Roadmap file (roadmaps/<name>.md) -> card topic. Card topics are fixed by API.md and
+# schema.sql, so the iOS roadmap produces "swe" cards.
+ROADMAPS = {"networking": "networking", "security": "security", "ai": "ai", "swe": "swe",
+            "ios": "swe"}
+# Lesson calls cycle through this list; iOS appears twice because the owner wants more of it.
+LESSON_ROTATION = ("networking", "ios", "security", "swe", "ai", "ios")
 
 
 # ---------- roadmaps ----------
@@ -99,6 +106,9 @@ def candidate_items(con) -> list[dict]:
                           "title": html_to_text(e.get("title", "")),
                           "text": html_to_text(summary)})
         per_feed.append(fresh)
+    # A news call takes only BATCH_SIZE items, so a fixed order would always favour the
+    # feeds at the top of feeds.txt. Shuffle so every feed gets a turn.
+    random.shuffle(per_feed)
     out = []
     while any(per_feed):
         for lst in per_feed:
@@ -242,11 +252,14 @@ def make_news_cards(con, items: list[dict]) -> list[int]:
     return ids
 
 
-def make_lesson_cards(con, topic: str, count: int):
-    """One call for the next `count` parts of the current series (never crossing into the
-    next series). Returns new card ids, or None if the roadmap is finished."""
-    items = load_roadmap(topic)
-    idx = con.execute("SELECT next_item FROM topics WHERE topic = ?", (topic,)).fetchone()[0]
+def make_lesson_cards(con, roadmap: str, count: int):
+    """One call for the next `count` parts of the current series in roadmaps/<roadmap>.md
+    (never crossing into the next series). Returns new card ids, or None if it is finished.
+    Progress is kept per roadmap in the `topics` table."""
+    topic = ROADMAPS[roadmap]
+    items = load_roadmap(roadmap)
+    con.execute("INSERT OR IGNORE INTO topics (topic) VALUES (?)", (roadmap,))
+    idx = con.execute("SELECT next_item FROM topics WHERE topic = ?", (roadmap,)).fetchone()[0]
     if idx >= len(items):
         return None
     first = items[idx]
@@ -263,9 +276,9 @@ def make_lesson_cards(con, topic: str, count: int):
     reply = ask_claude(prompt + visual_shapes())
 
     # Advance past every part sent, even dropped ones: a batch is never retried.
-    con.execute("UPDATE topics SET next_item = next_item + ? WHERE topic = ?", (len(parts), topic))
+    con.execute("UPDATE topics SET next_item = next_item + ? WHERE topic = ?", (len(parts), roadmap))
     con.commit()
-    label = f"{topic}/{first['series_id']}"
+    label = f"{roadmap}/{first['series_id']}"
     try:
         entries = parse_json_reply(reply, "[")
         if not isinstance(entries, list):
@@ -315,13 +328,14 @@ def run(target: int, max_calls: int, exact: bool) -> int:
     con = connect()
     inserted = calls = 0
     news_queue = None
-    topic_turn = int(meta_get(con, "lesson_rotation", "0"))
+    turn = int(meta_get(con, "lesson_rotation", "0"))
+    roadmaps = set(LESSON_ROTATION)
     want_news = meta_get(con, "next_is_news", "1") == "1"
-    done_topics: set[str] = set()
+    done: set[str] = set()
     news_empty = False
     try:
         while inserted < target and calls < max_calls:
-            if news_empty and len(done_topics) == len(TOPICS):
+            if news_empty and done == roadmaps:
                 log.warning("no new feed items and all roadmaps finished; stopping")
                 break
             count = min(BATCH_SIZE, target - inserted) if exact else BATCH_SIZE
@@ -338,22 +352,22 @@ def run(target: int, max_calls: int, exact: bool) -> int:
                 ids = make_news_cards(con, batch)
                 kind = "news"
             else:
-                if len(done_topics) == len(TOPICS):
+                if done == roadmaps:
                     want_news = True  # every roadmap finished: news only
                     continue
-                topic = TOPICS[topic_turn % len(TOPICS)]
-                topic_turn += 1
-                meta_set(con, "lesson_rotation", str(topic_turn % len(TOPICS)))
-                if topic in done_topics:
+                roadmap = LESSON_ROTATION[turn % len(LESSON_ROTATION)]
+                turn += 1
+                meta_set(con, "lesson_rotation", str(turn % len(LESSON_ROTATION)))
+                if roadmap in done:
                     continue
                 calls += 1
-                ids = make_lesson_cards(con, topic, count)
+                ids = make_lesson_cards(con, roadmap, count)
                 if ids is None:
                     calls -= 1  # no call was made
-                    log.info("roadmap finished for %s; add items to roadmaps/%s.md", topic, topic)
-                    done_topics.add(topic)
+                    log.info("roadmap finished: add items to roadmaps/%s.md", roadmap)
+                    done.add(roadmap)
                     continue
-                kind = f"lesson/{topic}"
+                kind = f"lesson/{roadmap}"
             inserted += len(ids)
             log.info("call %d (%s): inserted %d cards %s", calls, kind, len(ids), ids)
             want_news = not want_news
