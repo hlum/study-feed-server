@@ -4,13 +4,13 @@ The base URL is `http://<tailscale-ip>:8000`. Every body is JSON. There's no aut
 
 ## Card schema
 
-The server stores this object and returns it as-is. Claude must produce exactly this shape. The server adds `id`, `rare`, `created_at`.
+The server stores this object and returns it as-is. Claude must produce exactly this shape. The server adds `id`, `rare`, `created_at`, `kind`, `lang` and `site`.
 
 ```json
 {
   "id": 42,
   "card_type": "poster | post | terminal",
-  "topic": "networking | security | ai | swe",
+  "topic": "networking | security | ai | swe | ios",
   "series_id": "tcp-basics",
   "part": 4,
   "parts_total": 12,
@@ -29,7 +29,10 @@ The server stores this object and returns it as-is. Claude must produce exactly 
   "flashcard": { "front": "...", "back": "..." },
   "deeper": null,
   "rare": false,
-  "created_at": "2026-10-15T03:00:00"
+  "created_at": "2026-10-15T03:00:00",
+  "kind": "lesson",
+  "lang": "en",
+  "site": null
 }
 ```
 
@@ -42,6 +45,11 @@ Rules:
 - **`title`** is at most 80 chars. **`body`** is at most 280 chars. **`cliffhanger`** is at most 70 chars.
 - **`quiz`** is required, with exactly 4 options. **`flashcard`** is required.
 - **`deeper`** is null until `/cards/{id}/deeper` fills it with markdown.
+- **`topic`:** `ios` covers iOS, Swift, SwiftUI, Xcode and the App Store. Cards from feeds tagged `[ios]` in `feeds.txt` always get `ios`.
+- **`kind`:** `"news"` for cards made from a feed article, `"lesson"` for roadmap cards.
+- **`lang`:** the language of the card's source article: `"ja"` for Japanese articles, otherwise `"en"`. Lessons are `"en"`. Each card in a batch is judged on its own article. Treat it as optional in the app.
+- **`site`:** for news cards, the article's site, with one normalized spelling per site (e.g. `"Qiita"`, `"Zenn"`, `"Swift by Sundell"`; unknown sites use the bare hostname). `null` for lessons.
+- `kind`, `lang` and `site` appear on every card the API returns: `/feed`, `/review`, `/saved`.
 
 `visual` (on the card or on a slide) is one of these shapes:
 

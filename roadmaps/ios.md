@@ -1,6 +1,6 @@
 # iOS roadmap
 
-Each `##` is a series and each numbered line is one card. Cards from this file use topic `swe`. The reader is a working iOS engineer, so go past the basics: explain the mechanism, and show real Swift code, LLDB or Instruments output.
+Each `##` is a series and each numbered line is one card. Cards from this file use topic `ios`. The reader is a working iOS engineer, so go past the basics: explain the mechanism, and show real Swift code, LLDB or Instruments output.
 
 ## swift-concurrency: Swift concurrency for real
 1. async/await: what a suspension point really is
@@ -57,3 +57,20 @@ Each `##` is a series and each numbered line is one card. Cards from this file u
 3. Hangs and hitches: what they are and how to find them
 4. Why Swift type checking gets slow, and how to fix it
 5. Swift Package Manager: packages, targets and version resolution
+
+## xcode: Getting more out of Xcode
+1. Build settings, configurations and .xcconfig files
+2. Schemes, test plans and launch arguments
+3. Xcode Previews: how they run your code, and why they break
+4. Signing in Xcode: automatic vs. manual, and fixing signing errors
+5. Build times: reading the build timeline and caching
+6. xcodebuild and simulators from the command line
+
+## app-store: Shipping to the App Store
+1. App Store Connect: apps, builds and versions
+2. TestFlight: internal vs. external testers and build review
+3. App Review: the guidelines that reject apps most often
+4. StoreKit 2: products, transactions and verification
+5. Subscriptions: groups, renewals and server notifications
+6. Phased releases, and rolling back a bad build
+7. Privacy manifests and App Privacy labels

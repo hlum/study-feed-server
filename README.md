@@ -76,8 +76,11 @@ Each card in a reply is validated on its own: bad cards are logged and dropped, 
 
 ## Content sources
 
-- **News:** `feeds.txt` holds one RSS/Atom URL per line. It covers general tech, security, AI, iOS/Swift, Qiita, Zenn, and Japanese company tech blogs. Each run shuffles the feed order, so every feed gets a turn. When a summary is thin (Qiita summaries, for example), the article body is fetched with trafilatura. Cards are written in English, including for Japanese articles.
-- **Lessons:** `roadmaps/*.md`. Lesson calls rotate `networking → ios → security → swe → ai → ios` (`LESSON_ROTATION` in `ingest.py`), so iOS gets a third of all lessons. `topic` is limited to the four values in `API.md`, so iOS cards use `topic: "swe"`. Progress per roadmap is kept in the `topics` table.
+- **News:** `feeds.txt` holds one RSS/Atom URL per line. It covers general tech, security, AI, iOS/Swift, Qiita, Zenn, and Japanese company tech blogs. Each run shuffles the feed order, so every feed gets a turn. When a summary is thin (Qiita summaries, for example), the article body is fetched with trafilatura.
+- **iOS feeds:** add `[ios]` after a URL in `feeds.txt` to mark it as an iOS feed. Its cards always get `topic: "ios"`. For other feeds, Claude picks the topic, and `ios` is one of the options.
+- **Card fields:** each card gets `kind` (`news`/`lesson`), `lang` (`ja` when its own article is Japanese, otherwise `en`) and, for news, `site` (one spelling per site; see `SITE_NAMES` in `core.py`). Cards are currently written in English, even for Japanese articles.
+- **Lessons:** `roadmaps/*.md`. Lesson calls rotate `networking → ios → security → swe → ai → ios` (`LESSON_ROTATION` in `ingest.py`), so iOS gets a third of all lessons. `roadmaps/ios.md` covers Swift concurrency, SwiftUI, memory, lifecycle, networking, security, tooling, Xcode and the App Store. Progress per roadmap is kept in the `topics` table.
+- **Schema upgrades:** `init_db()` migrates older databases automatically: it rebuilds `cards` for the new `ios` topic without losing rows, and fills in `kind`/`lang`/`site`.
 - **X/Twitter:** not supported. There's no free feed, the API is paid, and scraping breaks X's terms. To follow particular people, add their blog, newsletter, or a Bluesky profile feed (`https://bsky.app/profile/<handle>/rss`) to `feeds.txt`.
 
 ## Configuration (`.env`)

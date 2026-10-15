@@ -1,4 +1,5 @@
 # One RSS/Atom URL per line. Lines starting with # are ignored.
+# Add [ios] after a URL for feeds about iOS: their cards get topic "ios".
 # The owner edits this list. Ingest skips feeds that fail and logs them.
 
 # General tech
@@ -25,28 +26,28 @@ https://danluu.com/atom.xml
 https://github.blog/engineering/feed/
 
 # iOS / Swift
-https://developer.apple.com/news/rss/news.rss
-https://www.swiftbysundell.com/rss
-https://www.hackingwithswift.com/articles/rss
-https://www.avanderlee.com/feed/
-https://www.donnywals.com/feed/
-https://nshipster.com/feed.xml
-https://useyourloaf.com/blog/rss.xml
-https://iosdevweekly.com/issues.rss
-https://sarunw.com/feed.xml
-https://www.polpiella.dev/rss.xml
+https://developer.apple.com/news/rss/news.rss  [ios]
+https://www.swiftbysundell.com/rss  [ios]
+https://www.hackingwithswift.com/articles/rss  [ios]
+https://www.avanderlee.com/feed/  [ios]
+https://www.donnywals.com/feed/  [ios]
+https://nshipster.com/feed.xml  [ios]
+https://useyourloaf.com/blog/rss.xml  [ios]
+https://iosdevweekly.com/issues.rss  [ios]
+https://sarunw.com/feed.xml  [ios]
+https://www.polpiella.dev/rss.xml  [ios]
 
 # Japanese: Qiita (popular + iOS tags)
 https://qiita.com/popular-items/feed
-https://qiita.com/tags/swift/feed
-https://qiita.com/tags/ios/feed
-https://qiita.com/tags/swiftui/feed
+https://qiita.com/tags/swift/feed  [ios]
+https://qiita.com/tags/ios/feed  [ios]
+https://qiita.com/tags/swiftui/feed  [ios]
 
 # Japanese: Zenn (trending + iOS topics)
 https://zenn.dev/feed
-https://zenn.dev/topics/swift/feed
-https://zenn.dev/topics/ios/feed
-https://zenn.dev/topics/swiftui/feed
+https://zenn.dev/topics/swift/feed  [ios]
+https://zenn.dev/topics/ios/feed  [ios]
+https://zenn.dev/topics/swiftui/feed  [ios]
 
 # Japanese: news and company tech blogs
 https://b.hatena.ne.jp/hotentry/it.rss

@@ -22,7 +22,7 @@ TOPUP_MAX_CALLS = int(os.getenv("TOPUP_MAX_CALLS", "3"))
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL") or "sonnet"
 RARE_RATE = float(os.getenv("RARE_RATE", "0.08"))
 TOPUP_THRESHOLD = 60
-TOPICS = ("networking", "security", "ai", "swe")
+TOPICS = ("networking", "security", "ai", "swe", "ios")
 LOG_DIR = ROOT / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
@@ -64,7 +64,134 @@ def connect() -> sqlite3.Connection:
 def init_db() -> None:
     con = connect()
     con.executescript((ROOT / "schema.sql").read_text())
+    migrate(con)
     con.close()
+
+
+def migrate(con) -> None:
+    """Idempotent upgrades for databases created by older versions of schema.sql."""
+    # 1. cards.topic CHECK gained 'ios'. SQLite can't alter a CHECK, so rebuild the table
+    #    (official 12-step procedure): copy every row into a new table with the new schema.
+    sql = con.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cards'").fetchone()[0]
+    if "'ios'" not in sql:
+        schema = (ROOT / "schema.sql").read_text()
+        create = re.search(r"CREATE TABLE IF NOT EXISTS cards \(.*?\n\);", schema, re.S).group(0)
+        before = con.execute("SELECT COUNT(*) FROM cards").fetchone()[0]
+        con.execute("PRAGMA foreign_keys = OFF")
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            con.execute(create.replace("IF NOT EXISTS cards", "cards_new"))
+            con.execute("INSERT INTO cards_new SELECT * FROM cards")
+            con.execute("DROP TABLE cards")
+            con.execute("ALTER TABLE cards_new RENAME TO cards")
+            con.execute("CREATE INDEX IF NOT EXISTS cards_unseen ON cards (seen_at, created_at)")
+            bad = con.execute("PRAGMA foreign_key_check").fetchall()
+            after = con.execute("SELECT COUNT(*) FROM cards").fetchone()[0]
+            if bad or after != before:
+                raise RuntimeError(f"cards migration check failed: {before}->{after} rows, fk {bad}")
+            con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+        finally:
+            con.execute("PRAGMA foreign_keys = ON")
+        log.warning("migrated cards table: topic may now be 'ios' (%d cards kept)", after)
+
+    # 2. Cards gained kind/lang/site. Fill them in for older cards, and move iOS
+    #    lessons and cards from [ios] feeds to the new "ios" topic.
+    ios_feeds = {url for url, tags in load_feeds() if "ios" in tags}
+    ios_series = ios_series_ids()
+    rows = con.execute("SELECT c.id, c.topic, c.series_id, c.data, s.url AS src_url, s.feed "
+                       "FROM cards c LEFT JOIN sources s ON s.id = c.source_id "
+                       "WHERE json_extract(c.data, '$.kind') IS NULL").fetchall()
+    for r in rows:
+        card = json.loads(r["data"])
+        is_news = r["src_url"] is not None
+        card["kind"] = "news" if is_news else "lesson"
+        quote = (card.get("source") or {}).get("quote") or ""
+        card["lang"] = "ja" if is_news and (is_japanese(quote) or is_japanese_site(r["src_url"])) else "en"
+        card["site"] = site_name(r["src_url"]) if is_news else None
+        if (is_news and r["feed"] in ios_feeds) or (r["series_id"] in ios_series):
+            card["topic"] = "ios"
+        con.execute("UPDATE cards SET data = ?, topic = ? WHERE id = ?",
+                    (json.dumps(card), card["topic"], r["id"]))
+    if rows:
+        con.commit()
+        log.warning("added kind/lang/site to %d older cards", len(rows))
+
+
+# ---------- feeds, sites and language ----------
+
+def load_feeds() -> list[tuple[str, set[str]]]:
+    """feeds.txt: one URL per line, optionally followed by tags like [ios]."""
+    out = []
+    for line in (ROOT / "feeds.txt").read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        url = line.split()[0]
+        out.append((url, {t.lower() for t in re.findall(r"\[(\w+)\]", line[len(url):])}))
+    return out
+
+
+def ios_series_ids() -> set[str]:
+    path = ROOT / "roadmaps" / "ios.md"
+    return set(re.findall(r"^##\s+([\w-]+)\s*:", path.read_text(), re.M)) if path.exists() else set()
+
+
+# One spelling per site, keyed by host (without "www."). Unknown hosts use the bare host.
+SITE_NAMES = {
+    "qiita.com": "Qiita", "zenn.dev": "Zenn", "b.hatena.ne.jp": "Hatena Bookmark",
+    "publickey1.jp": "Publickey", "gihyo.jp": "gihyo.jp", "dev.classmethod.jp": "DevelopersIO",
+    "techlife.cookpad.com": "Cookpad Tech Blog", "engineering.mercari.com": "Mercari Engineering",
+    "techblog.lycorp.co.jp": "LY Corporation Tech Blog",
+    "developers.cyberagent.co.jp": "CyberAgent Developers Blog",
+    "engineering.dena.com": "DeNA Engineering",
+    "developer.apple.com": "Apple Developer", "swiftbysundell.com": "Swift by Sundell",
+    "hackingwithswift.com": "Hacking with Swift", "avanderlee.com": "SwiftLee",
+    "donnywals.com": "Donny Wals", "nshipster.com": "NSHipster", "useyourloaf.com": "Use Your Loaf",
+    "iosdevweekly.com": "iOS Dev Weekly", "sarunw.com": "Sarunw", "polpiella.dev": "Pol Piella",
+    "news.ycombinator.com": "Hacker News", "lobste.rs": "Lobsters",
+    "krebsonsecurity.com": "Krebs on Security", "schneier.com": "Schneier on Security",
+    "portswigger.net": "PortSwigger Research", "blog.cloudflare.com": "Cloudflare Blog",
+    "tailscale.com": "Tailscale", "arxiv.org": "arXiv", "huggingface.co": "Hugging Face",
+    "simonwillison.net": "Simon Willison", "jvns.ca": "Julia Evans", "danluu.com": "Dan Luu",
+    "github.blog": "GitHub Blog",
+}
+JAPANESE_SITES = {"qiita.com", "zenn.dev", "b.hatena.ne.jp", "publickey1.jp", "gihyo.jp",
+                  "dev.classmethod.jp", "techlife.cookpad.com", "engineering.mercari.com",
+                  "techblog.lycorp.co.jp", "developers.cyberagent.co.jp", "engineering.dena.com"}
+
+
+def _host(url: str) -> str:
+    from urllib.parse import urlparse
+    host = (urlparse(url or "").hostname or "").lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def site_name(url: str) -> str | None:
+    host = _host(url)
+    if not host:
+        return None
+    for known, name in SITE_NAMES.items():
+        if host == known or host.endswith("." + known):  # e.g. export.arxiv.org -> arXiv
+            return name
+    return host
+
+
+def is_japanese_site(url: str) -> bool:
+    host = _host(url)
+    return host in JAPANESE_SITES or host.endswith(".jp")
+
+
+_KANA = re.compile(r"[\u3040-\u30ff]")  # hiragana + katakana: Japanese, not Chinese
+
+
+def is_japanese(text: str) -> bool:
+    """True when the text is written in Japanese (kana make up a real share of it)."""
+    sample = (text or "")[:3000]
+    kana = len(_KANA.findall(sample))
+    return kana >= 10 or (kana >= 2 and kana >= len(sample) * 0.05)
 
 
 def meta_get(con, key, default=None):

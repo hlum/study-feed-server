@@ -5,7 +5,7 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS cards (
   id          INTEGER PRIMARY KEY,
   card_type   TEXT NOT NULL CHECK (card_type IN ('poster', 'post', 'terminal')),
-  topic       TEXT NOT NULL CHECK (topic IN ('networking', 'security', 'ai', 'swe')),
+  topic       TEXT NOT NULL CHECK (topic IN ('networking', 'security', 'ai', 'swe', 'ios')),
   series_id   TEXT,
   part        INTEGER,
   rare        INTEGER NOT NULL DEFAULT 0,
@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS topics (
   topic      TEXT PRIMARY KEY,
   next_item  INTEGER NOT NULL DEFAULT 0
 );
-INSERT OR IGNORE INTO topics (topic) VALUES ('networking'), ('security'), ('ai'), ('swe');
+INSERT OR IGNORE INTO topics (topic) VALUES ('networking'), ('security'), ('ai'), ('swe'), ('ios');
 
 -- First quiz answer per card (later answers give no XP).
 CREATE TABLE IF NOT EXISTS answers (

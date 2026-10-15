@@ -49,6 +49,10 @@ def card_out(row, is_review: bool | None = None) -> dict:
     card = json.loads(row["data"])
     card.update(id=row["id"], rare=bool(row["rare"]), created_at=row["created_at"],
                 deeper=row["deeper"])
+    # kind/lang/site are stored on the card; defaults only matter for very old rows.
+    card.setdefault("kind", "news" if row["source_id"] else "lesson")
+    card.setdefault("lang", "en")
+    card.setdefault("site", None)
     if is_review is not None:
         card["is_review"] = is_review
     return card

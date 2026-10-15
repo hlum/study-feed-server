@@ -20,7 +20,7 @@ Pick the card_type:
 - "terminal" when the point is something you can run or read: a command, a config, a code fix, a log line. Put real, runnable content in visual.kind "terminal" or "code".
 - "poster" only for a genuinely big idea that needs 3-5 slides.
 
-Pick the topic: networking, security, ai, or swe.
+Pick the topic: networking, security, ai, swe, or ios (iOS, Swift, SwiftUI, Xcode, Apple platforms and the App Store).
 
 Voice:
 - Plain and specific, like a sharp colleague.

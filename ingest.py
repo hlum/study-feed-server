@@ -24,7 +24,8 @@ import trafilatura
 from cards import Invalid, quote_is_verbatim, validate_card
 from core import (BATCH_SIZE, BUFFER_TARGET, CLAUDE_MODEL, LOG_DIR, NIGHTLY_CALLS, RARE_RATE, ROOT,
                   TOPUP_MAX_CALLS, TOPUP_THRESHOLD,
-                  ClaudeError, ask_claude, connect, defang, fill, init_db, iso, load_prompt,
+                  ClaudeError, ask_claude, connect, defang, fill, init_db, is_japanese, iso,
+                  load_feeds, load_prompt, site_name,
                   meta_get, meta_set, now, parse_json_reply)
 
 log = logging.getLogger("studyfeed.ingest")
@@ -32,10 +33,9 @@ UA = "StudyFeed/1.0 (personal RSS reader)"
 MAX_BYTES = 2_000_000
 ARTICLE_CHARS = 4000  # per article; 5 articles share one prompt
 
-# Roadmap file (roadmaps/<name>.md) -> card topic. Card topics are fixed by API.md and
-# schema.sql, so the iOS roadmap produces "swe" cards.
+# Roadmap file (roadmaps/<name>.md) -> card topic.
 ROADMAPS = {"networking": "networking", "security": "security", "ai": "ai", "swe": "swe",
-            "ios": "swe"}
+            "ios": "ios"}
 # Lesson calls cycle through this list; iOS appears twice because the owner wants more of it.
 LESSON_ROTATION = ("networking", "ios", "security", "swe", "ai", "ios")
 
@@ -81,10 +81,8 @@ def url_hash(url: str) -> str:
 
 def candidate_items(con) -> list[dict]:
     """New feed entries, round-robin across feeds so one feed can't dominate."""
-    feeds = [l.strip() for l in (ROOT / "feeds.txt").read_text().splitlines()
-             if l.strip() and not l.strip().startswith("#")]
     per_feed = []
-    for feed in feeds:
+    for feed, tags in load_feeds():
         try:
             parsed = feedparser.parse(http_get(feed))
             if parsed.bozo and not parsed.entries:
@@ -102,7 +100,7 @@ def candidate_items(con) -> list[dict]:
             summary = e.get("summary") or ""
             if e.get("content"):
                 summary = max((c.get("value", "") for c in e.content), key=len, default=summary)
-            fresh.append({"url": link, "feed": feed, "feed_name": feed_name[:120],
+            fresh.append({"url": link, "feed": feed, "feed_name": feed_name[:120], "ios": "ios" in tags,
                           "title": html_to_text(e.get("title", "")),
                           "text": html_to_text(summary)})
         per_feed.append(fresh)
@@ -245,6 +243,11 @@ def make_news_cards(con, items: list[dict]) -> list[int]:
             log_rejected("news", f"{item['url']}: {e}", raw)
             continue
         card["source"] = news_source(model_src, item, problems)
+        if item["ios"]:
+            card["topic"] = "ios"  # cards from [ios] feeds are always iOS
+        # Language comes from this card's own article, never from the rest of the batch.
+        card.update(kind="news", lang="ja" if is_japanese(item["title"] + " " + item["text"]) else "en",
+                    site=site_name(item["url"]))
         for p in problems:
             log.info("news card fix: %s", p)
         ids.append(insert_card(con, card, source_ids[i]))
@@ -311,6 +314,7 @@ def make_lesson_cards(con, roadmap: str, count: int):
             card["source"] = None
         for p in problems:
             log.info("lesson card fix: %s", p)
+        card.update(kind="lesson", lang="en", site=None)
         ids.append(insert_card(con, card))
     con.commit()
     return ids
