@@ -2,7 +2,7 @@
 import re
 import xml.etree.ElementTree as ET
 
-from core import TOPICS
+from core import TOPICS, is_japanese
 
 CARD_TYPES = ("poster", "post", "terminal")
 VISUAL_KINDS = ("steps", "code", "terminal", "mermaid", "svg")
@@ -162,7 +162,17 @@ def _soft_visual(v, problems):
 
 # ---------- card ----------
 
-def validate_card(raw: dict, problems: list | None = None) -> dict:
+# Text limits per card language. Japanese limits are about half the English ones,
+# because each Japanese character carries more meaning.
+LIMITS = {
+    "en": {"title": 80, "body": 280, "cliffhanger": 70, "question": 300, "option": 200,
+           "explanation": 500, "front": 300, "back": 500},
+    "ja": {"title": 40, "body": 140, "cliffhanger": 35, "question": 150, "option": 100,
+           "explanation": 250, "front": 150, "back": 250},
+}
+
+
+def validate_card(raw: dict, problems: list | None = None, lang: str = "en") -> dict:
     """Return a clean card dict (only schema keys) or raise Invalid.
     Non-fatal fixes are appended to `problems` for logging."""
     problems = problems if problems is not None else []
@@ -178,9 +188,10 @@ def validate_card(raw: dict, problems: list | None = None) -> dict:
     c["series_id"] = raw.get("series_id") if isinstance(raw.get("series_id"), str) else None
     c["part"] = _int(raw.get("part"), "part", nullable=True)
     c["parts_total"] = _int(raw.get("parts_total"), "parts_total", nullable=True)
-    c["title"] = _str(raw.get("title"), "title", 80)
-    c["body"] = _str(raw.get("body"), "body", 280)
-    c["cliffhanger"] = _str(raw.get("cliffhanger"), "cliffhanger", 70)
+    lim = LIMITS[lang]
+    c["title"] = _str(raw.get("title"), "title", lim["title"])
+    c["body"] = _str(raw.get("body"), "body", lim["body"])
+    c["cliffhanger"] = _str(raw.get("cliffhanger"), "cliffhanger", lim["cliffhanger"])
 
     src = raw.get("source")
     if src is None:
@@ -202,8 +213,8 @@ def validate_card(raw: dict, problems: list | None = None) -> dict:
     if c["card_type"] == "poster":
         if not 3 <= len(slides) <= 5:
             raise Invalid(f"poster needs 3-5 slides, got {len(slides)}")
-        c["slides"] = [{"title": _str(s.get("title"), "slide.title", 80),
-                        "body": _str(s.get("body"), "slide.body", 280),
+        c["slides"] = [{"title": _str(s.get("title"), "slide.title", lim["title"]),
+                        "body": _str(s.get("body"), "slide.body", lim["body"]),
                         "visual": _soft_visual(s.get("visual"), problems)}
                        for s in slides if isinstance(s, dict)]
         if len(c["slides"]) != len(slides):
@@ -226,18 +237,25 @@ def validate_card(raw: dict, problems: list | None = None) -> dict:
     options = q.get("options")
     if not isinstance(options, list) or len(options) != 4:
         raise Invalid("quiz needs exactly 4 options")
-    c["quiz"] = {"question": _str(q.get("question"), "quiz.question", 300),
-                 "options": [_str(o, "quiz.option", 200) for o in options],
+    c["quiz"] = {"question": _str(q.get("question"), "quiz.question", lim["question"]),
+                 "options": [_str(o, "quiz.option", lim["option"]) for o in options],
                  "answer": _int(q.get("answer"), "quiz.answer"),
-                 "explanation": _str(q.get("explanation"), "quiz.explanation", 500)}
+                 "explanation": _str(q.get("explanation"), "quiz.explanation", lim["explanation"])}
     if not 0 <= c["quiz"]["answer"] <= 3:
         raise Invalid("quiz.answer must be 0-3")
 
     f = raw.get("flashcard")
     if not isinstance(f, dict):
         raise Invalid("flashcard is required")
-    c["flashcard"] = {"front": _str(f.get("front"), "flashcard.front", 300),
-                      "back": _str(f.get("back"), "flashcard.back", 500)}
+    c["flashcard"] = {"front": _str(f.get("front"), "flashcard.front", lim["front"]),
+                      "back": _str(f.get("back"), "flashcard.back", lim["back"])}
+    if lang == "ja":
+        # A Japanese article's card must really be in Japanese, every reader-facing part.
+        parts = {"title/body": c["title"] + c["body"], "quiz": c["quiz"]["question"] + c["quiz"]["explanation"],
+                 "flashcard": c["flashcard"]["front"] + c["flashcard"]["back"]}
+        not_ja = [k for k, v in parts.items() if not is_japanese(v)]
+        if not_ja:
+            raise Invalid("card for a Japanese article is not in Japanese: " + ", ".join(not_ja))
     return c
 
 

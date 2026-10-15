@@ -15,7 +15,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 import progress as P
-from cards import is_rfc_source
+from cards import LIMITS, is_rfc_source
 from core import (TOPICS, ClaudeError, ask_claude, claude_args, claude_env, connect, defang, fill,
                   init_db, iso, load_prompt, meta_get, now, parse_json_reply, start_of_day)
 
@@ -274,13 +274,19 @@ _deeper_locks: dict[int, threading.Lock] = {}
 _locks_guard = threading.Lock()
 
 
-def clean_deeper(md: str) -> str:
+def deeper_size(text: str, lang: str) -> int:
+    """English is capped in words (250); Japanese has no spaces, so in characters (600)."""
+    return len(re.sub(r"\s", "", text)) if lang == "ja" else len(text.split())
+
+
+def clean_deeper(md: str, lang: str = "en") -> str:
+    cap = 600 if lang == "ja" else 250
     md = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", md)            # no images
     md = re.sub(r"(?is)<\s*(img|script|iframe|svg|object|embed)\b[^>]*>", "", md)
     md = md.strip()
     if md.startswith("```") and md.endswith("```") and md.count("```") == 2:
         md = re.sub(r"^```\w*\n|\n?```$", "", md).strip()   # model wrapped it all in a fence
-    # Enforce the 250-word cap by dropping whole trailing blocks (never split a code fence).
+    # Enforce the cap by dropping whole trailing blocks (never split a code fence).
     blocks, cur, in_code = [], [], False
     for line in md.splitlines():
         if line.strip().startswith("```"):
@@ -295,8 +301,8 @@ def clean_deeper(md: str) -> str:
         blocks.append("\n".join(cur))
     out, words = [], 0
     for b in blocks:
-        n = len(b.split())
-        if words + n > 250 and out:
+        n = 0 if b.lstrip().startswith("```") else deeper_size(b, lang)  # code doesn't count
+        if words + n > cap and out:
             break
         out.append(b)
         words += n
@@ -317,7 +323,7 @@ def deeper(card_id: int):
             section = section.split("\n", 2)[2] if section.lstrip().startswith("DEEPER MODE") else section
             prompt = fill(section.strip(), card_json=defang(json.dumps(card, ensure_ascii=False)))
             try:
-                md = clean_deeper(ask_claude(prompt))
+                md = clean_deeper(ask_claude(prompt), card.get("lang", "en"))
             except ClaudeError as e:
                 log.error("deeper failed for card %d: %s", card_id, e)
                 raise HTTPException(503, "Claude is unavailable right now (usage limit?). Try later."
@@ -366,13 +372,14 @@ def split_suggestions(text: str):
 
 
 def make_flashcard_card(con, parent_id: int, parent: dict, fc: dict) -> int:
+    lim = LIMITS[parent.get("lang", "en")]
     """A review-only card built from the thread: seen already, due tomorrow."""
     front, back = str(fc["front"]).strip(), str(fc["back"]).strip()
     if not front or not back:
         raise ValueError("empty flashcard")
     card = {**parent, "card_type": "post", "part": None, "parts_total": None,
-            "title": front[:80], "body": back[:280], "source": None, "slides": [],
-            "visual": None, "flashcard": {"front": front[:300], "back": back[:500]}}
+            "title": front[:lim["title"]], "body": back[:lim["body"]], "source": None, "slides": [],
+            "visual": None, "flashcard": {"front": front[:lim["front"]], "back": back[:lim["back"]]}}
     for k in ("id", "rare", "created_at", "deeper", "is_review"):
         card.pop(k, None)
     t = iso(now())
@@ -396,6 +403,7 @@ async def ask(body: AskIn):
         con.execute("INSERT INTO messages (card_id, role, text, at) VALUES (?, 'user', ?, ?)",
                     (body.card_id, message, iso(now())))
     card.pop("deeper", None)
+    ja = card.get("lang") == "ja"  # replies to a Japanese card are in Japanese
     thread_txt = "\n".join(f"{m['role']}: {m['text']}" for m in history) or "(none)"
     prompt = fill(load_prompt("ask.md"), card_json=defang(json.dumps(card, ensure_ascii=False)),
                   last_10_messages=defang(thread_txt), message=defang(message))
@@ -412,11 +420,14 @@ async def ask(body: AskIn):
                 fc = parse_json_reply(reply)
                 with db() as con:
                     new_id = make_flashcard_card(con, body.card_id, card, fc)
-                text = f"Saved as a flashcard (card {new_id}). It shows up in Review tomorrow.\n\n" \
-                       f"Front: {fc['front']}\nBack: {fc['back']}"
+                text = (f"フラッシュカードに保存しました（カード {new_id}）。明日の復習に出てきます。\n\n"
+                        f"表: {fc['front']}\n裏: {fc['back']}" if ja else
+                        f"Saved as a flashcard (card {new_id}). It shows up in Review tomorrow.\n\n"
+                        f"Front: {fc['front']}\nBack: {fc['back']}")
             except (ClaudeError, ValueError, KeyError, TypeError) as e:
                 log.error("flashcard failed: %s", e)
-                text = "Sorry, I couldn't make a flashcard right now. Try again later."
+                text = ("すみません、今はフラッシュカードを作れませんでした。しばらくしてからもう一度お試しください。"
+                        if ja else "Sorry, I couldn't make a flashcard right now. Try again later.")
             store_reply(text)
             yield sse("token", {"text": text})
             yield sse("suggestions", [])
@@ -472,7 +483,9 @@ async def ask(body: AskIn):
             yield sse("token", {"text": answer_text[sent:]})
         if error and not answer_text:
             log.error("ask failed: %s", error)
-            answer_text = "Sorry, Claude is unavailable right now (possibly a usage limit). Try again later."
+            answer_text = ("すみません、今は Claude を利用できません（利用上限の可能性があります）。しばらくしてからお試しください。"
+                           if ja else
+                           "Sorry, Claude is unavailable right now (possibly a usage limit). Try again later.")
             yield sse("token", {"text": answer_text})
         store_reply(answer_text)
         yield sse("suggestions", sugg)

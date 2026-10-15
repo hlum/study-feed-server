@@ -50,4 +50,6 @@ Write at most 250 words of markdown that go one level deeper than the card. Stru
 - 1-2 tight paragraphs.
 - Optionally one code block of 4-8 lines. If you include it, follow it with notes labeled a, b, c that point at specific lines.
 
+If the card's "lang" is "ja", write the whole thing in Japanese: plain, polite Japanese (です・ます調) with no hype, keeping technical terms people actually use in English as they are (API, async/await, SwiftUI). The limit is then about 600 Japanese characters instead of 250 words. Code stays as code.
+
 No images, no tables, no emoji, no em-dashes. Return only the markdown.

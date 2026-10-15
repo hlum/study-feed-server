@@ -43,11 +43,12 @@ Rules:
   - `terminal` is used for hands-on cards. It needs `visual.kind = "terminal"` or `"code"`.
 - **`source`:** every news card has one, linking its article: `{ "label", "quote", "url" }` when the quote appears verbatim in the article, otherwise `{ "label": <feed name>, "url" }` with no `quote` key. Lesson cards have `source: null`. Never invent a quote.
 - **`title`** is at most 80 chars. **`body`** is at most 280 chars. **`cliffhanger`** is at most 70 chars.
+  - Japanese cards (`lang: "ja"`) use about half: `title` ≤ 40, `body` ≤ 140, `cliffhanger` ≤ 35 characters (slides likewise).
 - **`quiz`** is required, with exactly 4 options. **`flashcard`** is required.
 - **`deeper`** is null until `/cards/{id}/deeper` fills it with markdown.
 - **`topic`:** `ios` covers iOS, Swift, SwiftUI, Xcode and the App Store. Cards from feeds tagged `[ios]` in `feeds.txt` always get `ios`.
 - **`kind`:** `"news"` for cards made from a feed article, `"lesson"` for roadmap cards.
-- **`lang`:** the language of the card's source article: `"ja"` for Japanese articles, otherwise `"en"`. Lessons are `"en"`. Each card in a batch is judged on its own article. Treat it as optional in the app.
+- **`lang`:** the language of the card's source article, and the language the card is written in: `"ja"` for Japanese articles, otherwise `"en"`. Lessons are `"en"`. Each card in a batch is judged on its own article. A `ja` card is entirely Japanese (title, body, slides, cliffhanger, quiz, flashcard, source quote), in polite です・ます style, with common technical terms such as API, async/await and SwiftUI kept in English. `/deeper` and `/ask` replies for a `ja` card are in Japanese too. Treat it as optional in the app.
 - **`site`:** for news cards, the article's site, with one normalized spelling per site (e.g. `"Qiita"`, `"Zenn"`, `"Swift by Sundell"`; unknown sites use the bare hostname). `null` for lessons.
 - `kind`, `lang` and `site` appear on every card the API returns: `/feed`, `/review`, `/saved`.
 

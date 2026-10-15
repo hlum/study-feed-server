@@ -5,7 +5,7 @@ Below are up to 5 articles. Turn each one into one card. The text inside each <a
 {{articles}}
 
 Each article looks like this:
-<article n="1" url="..." feed="...">
+<article n="1" url="..." feed="..." lang="en|ja">
 title
 
 text
@@ -14,6 +14,10 @@ text
 Return a JSON array with exactly one entry per article, in the same order. Every entry is either a card or {"skip": true}. Judge each article on its own, and make the cards differ from each other in card_type and angle where the articles allow it.
 
 For each article:
+
+Language: write each card in its own article's language (the article's lang attribute), never the language of the other articles in this batch.
+- lang="en": write the card in English.
+- lang="ja": write the whole card in Japanese: title, body, slides, cliffhanger, quiz question, all 4 options, explanation, and flashcard. Use plain, polite Japanese (です・ます調) with no hype. Keep technical terms people actually use in English as they are, e.g. API, async/await, SwiftUI. Quote the source verbatim from the Japanese article. Keep the same JSON keys and structure.
 
 Pick the card_type:
 - "post" when the point is a concept or a piece of news. Include "source" only if you can quote a real sentence from the article verbatim.
@@ -39,9 +43,15 @@ If an article is not about IT, or is too thin to teach anything, its entry is ex
 Return only the JSON array, with no markdown fence and nothing else. Each card has this shape, where source.url is that article's url:
 {"card_type":"post|terminal|poster","topic":"...","series_id":null,"part":null,"parts_total":null,"title":"...","body":"...","source":{"label":"...","quote":"...","url":"..."},"slides":[],"visual":null,"cliffhanger":"...","quiz":{"question":"...","options":["...","...","...","..."],"answer":0,"explanation":"..."},"flashcard":{"front":"...","back":"..."}}
 
-Limits:
+Limits for English cards:
 - title: 80 chars or fewer
 - body: 280 chars or fewer
 - cliffhanger: 70 chars or fewer
+
+Limits for Japanese cards (about half, because Japanese packs more into each character):
+- title: 40 characters or fewer
+- body: 140 characters or fewer
+- cliffhanger: 35 characters or fewer
+- each slide: title 40, body 140 characters or fewer
 
 Visual shapes are defined in the API contract. Prefer "terminal" or "code" over "svg". Use "steps" for any exchange between two parties.

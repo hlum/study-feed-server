@@ -169,7 +169,7 @@ def insert_card(con, card: dict, source_id=None) -> int:
 def article_block(n: int, item: dict) -> str:
     url = defang(item["url"]).replace('"', "%22")
     feed = defang(item["feed"]).replace('"', "%22")
-    return (f'<article n="{n}" url="{url}" feed="{feed}">\n{defang(item["title"])}\n\n'
+    return (f'<article n="{n}" url="{url}" feed="{feed}" lang="{item["lang"]}">\n{defang(item["title"])}\n\n'
             f'{defang(item["text"])}\n</article>')
 
 
@@ -195,6 +195,8 @@ def make_news_cards(con, items: list[dict]) -> list[int]:
     """One call for up to BATCH_SIZE articles. Returns new card ids. Raises ClaudeError."""
     for it in items:
         it["text"] = article_text(it)
+        # Each article's own language; a card is never judged by the rest of its batch.
+        it["lang"] = "ja" if is_japanese(it["title"] + " " + it["text"]) else "en"
     prompt = fill(load_prompt("news_card.md"),
                   articles="\n\n".join(article_block(i + 1, it) for i, it in enumerate(items)))
     reply = ask_claude(prompt + visual_shapes())
@@ -238,16 +240,15 @@ def make_news_cards(con, items: list[dict]) -> list[int]:
             raw["source"] = None
             raw["series_id"] = raw["part"] = raw["parts_total"] = None
             problems = []
-            card = validate_card(raw, problems)
+            card = validate_card(raw, problems, lang=item["lang"])
         except (TypeError, AttributeError, Invalid) as e:
-            log_rejected("news", f"{item['url']}: {e}", raw)
+            log_rejected("news", f"{item['url']} [{item['lang']}]: {e}", raw)
             continue
         card["source"] = news_source(model_src, item, problems)
         if item["ios"]:
             card["topic"] = "ios"  # cards from [ios] feeds are always iOS
         # Language comes from this card's own article, never from the rest of the batch.
-        card.update(kind="news", lang="ja" if is_japanese(item["title"] + " " + item["text"]) else "en",
-                    site=site_name(item["url"]))
+        card.update(kind="news", lang=item["lang"], site=site_name(item["url"]))
         for p in problems:
             log.info("news card fix: %s", p)
         ids.append(insert_card(con, card, source_ids[i]))
