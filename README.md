@@ -11,7 +11,8 @@ It is reachable only over Tailscale. The API binds to this machine's Tailscale I
 | File | What it does |
 |---|---|
 | `app.py` | FastAPI app with every endpoint in `API.md` |
-| `ingest.py` | Cron job that generates cards with `claude -p` and keeps about 100 unseen |
+| `ingest.py` | Cron job: turns feed items into article cards (no model), and has `claude -p` write lesson cards |
+| `fetch.py` | Safe HTTP fetches (timeouts, size cap, public addresses only) and the reader view (trafilatura) |
 | `core.py` | Config, SQLite, clock, and the sandboxed `claude -p` wrapper |
 | `cards.py` | Card schema validation and SVG/Mermaid sanitizing |
 | `progress.py` | SM-2, XP/levels, streak/freezes, badges |
@@ -54,33 +55,45 @@ curl -s http://100.65.4.50:8001/health # buffer size, last ingest, last error
 
 ## Ingest
 
-Each `claude -p` call makes `BATCH_SIZE` (default 5) cards. A news call sends 5 articles, and a lesson call sends the next 5 parts of one series. Calls alternate between news and lessons, and lessons rotate through the 4 topics.
+Every run does two things:
 
-The cron jobs are installed (`crontab -l`; a copy is in `deploy/crontab.txt`):
+1. **Articles, with no model call.** Each new item in `feeds.txt` becomes an `article` card:
+   - the feed's title, its summary (or first paragraph) cut to about 280 characters (140 for Japanese), the link, the site, and the publish date;
+   - at most 5 new items per feed per run, so no single site floods the feed;
+   - items already seen are skipped (same URL ignoring tracking parameters, or same title);
+   - items with no title or no text are dropped. That affects Hacker News, Lobsters and Hugging Face, whose feeds carry no summary.
+2. **Lessons, written by Claude.** Each `claude -p` call writes the next `BATCH_SIZE` (5) parts of one series. Calls rotate through the roadmaps. Whether ingest calls Claude at all depends on the **lesson buffer** (unseen lessons only), because articles cost nothing:
+   - `0 3 * * *` runs `--nightly`: fills toward `LESSON_BUFFER_TARGET` (default 50, half of `BUFFER_TARGET`), at most `NIGHTLY_CALLS` (5) calls.
+   - `0 */4 * * *` runs `--topup`: calls Claude only if the lesson buffer is under `LESSON_TOPUP_THRESHOLD` (default 30), at most `TOPUP_MAX_CALLS` (3) calls.
 
-- `0 3 * * *` runs `--nightly`: fills toward `BUFFER_TARGET`, at most `NIGHTLY_CALLS` (5) calls.
-- `0 */4 * * *` runs `--topup`: only runs if the buffer is under 60, at most `TOPUP_MAX_CALLS` (3) calls.
+The cron jobs are installed (`crontab -l`; a copy is in `deploy/crontab.txt`).
 
 To run ingest manually:
 
 ```sh
 cd ~/server-setup
-.venv/bin/python ingest.py --limit 5    # insert 5 cards now, whatever the buffer
+.venv/bin/python ingest.py --articles-only  # new feed articles only, zero model calls
+.venv/bin/python ingest.py --limit 5        # articles, plus 5 lesson cards now, whatever the buffer
 .venv/bin/python ingest.py --nightly
 .venv/bin/python ingest.py --topup
 ```
 
-If a call fails or hits a Pro usage limit, the run stops and records the error in `/health`. The next cron run retries.
+The log line `articles: inserted N with 0 model calls` and the `lesson summary: N calls: ...` line show what each run did.
 
-Each card in a reply is validated on its own: bad cards are logged and dropped, and good ones are kept. Lesson parts that get dropped are not retried. When a roadmap file is finished, ingest logs it, and you can add more items to `roadmaps/<topic>.md`.
+If a call fails or hits a Pro usage limit, the run stops and records the error in `/health`. The next cron run retries. Articles are inserted before any call, so they never depend on Claude.
+
+Each lesson card in a reply is validated on its own: bad cards are logged and dropped, and good ones are kept. Lesson parts that get dropped are not retried. When a roadmap file is finished, ingest logs it, and you can add more items to `roadmaps/<topic>.md`.
 
 ## Content sources
 
-- **News:** `feeds.txt` holds one RSS/Atom URL per line. It covers general tech, security, AI, iOS/Swift, Qiita, Zenn, and Japanese company tech blogs. Each run shuffles the feed order, so every feed gets a turn. When a summary is thin (Qiita summaries, for example), the article body is fetched with trafilatura.
-- **iOS feeds:** add `[ios]` after a URL in `feeds.txt` to mark it as an iOS feed. Its cards always get `topic: "ios"`. For other feeds, Claude picks the topic, and `ios` is one of the options.
-- **Card fields:** each card gets `kind` (`news`/`lesson`), `lang` (`ja` when its own article is Japanese, otherwise `en`) and, for news, `site` (one spelling per site; see `SITE_NAMES` in `core.py`). Cards from Japanese articles are written entirely in Japanese (です・ます, English technical terms kept), with about half the English length limits. Their "go deeper" and Ask replies are in Japanese too. A Japanese card that comes back in English is dropped and logged.
+- **News:** `feeds.txt` holds one RSS/Atom URL per line. It covers general tech, security, AI, iOS/Swift, Qiita, Zenn, and Japanese company tech blogs. Each run interleaves the feeds in a shuffled order, so card ids don't cluster by site.
+- **Topics:** put a tag after each URL in `feeds.txt`: `[ios]`, `[security]`, `[ai]`, `[swe]` or `[networking]`. That feed's article cards get that topic. Untagged feeds get `swe` (`ARTICLE_DEFAULT_TOPIC` in `ingest.py`).
+- **Card fields:** each card gets `kind` (`news`/`lesson`), `lang` and, for news, `site` (one spelling per site; see `SITE_NAMES` in `core.py`). An article is `ja` if its title or body contains any hiragana, katakana or kanji. Its "go deeper", Ask replies and on-demand quiz are in Japanese too.
+- **Older news cards:** the model-written news cards from before articles keep their content, quiz and flashcard. `prompts/news_card.md` is no longer used.
+- **Reader view:** `GET /cards/{id}/reader` fetches the article page once (2 MB cap, timeouts), extracts the main text with trafilatura, and stores it in the `readers` table.
+- **On-demand quiz:** `POST /cards/{id}/quiz` makes one quiz for an article with one Claude call (`prompts/article_quiz.md`) and saves it on the card.
 - **Lessons:** `roadmaps/*.md`. Lesson calls rotate `networking → ios → security → swe → ai → ios` (`LESSON_ROTATION` in `ingest.py`), so iOS gets a third of all lessons. `roadmaps/ios.md` covers Swift concurrency, SwiftUI, memory, lifecycle, networking, security, tooling, Xcode and the App Store. Progress per roadmap is kept in the `topics` table.
-- **Schema upgrades:** `init_db()` migrates older databases automatically: it rebuilds `cards` for the new `ios` topic without losing rows, and fills in `kind`/`lang`/`site`.
+- **Schema upgrades:** `init_db()` migrates older databases automatically. It rebuilds `cards` for new `CHECK` values (the `ios` topic, the `article` card type) without losing rows, saving a copy of the database in `logs/study-before-migration-*.db` first. It also fills in `kind`/`lang`/`site`.
 - **X/Twitter:** not supported. There's no free feed, the API is paid, and scraping breaks X's terms. To follow particular people, add their blog, newsletter, or a Bluesky profile feed (`https://bsky.app/profile/<handle>/rss`) to `feeds.txt`.
 
 ## Configuration (`.env`)
@@ -90,6 +103,7 @@ Each card in a reply is validated on its own: bad cards are logged and dropped, 
 | `CLAUDE_MODEL` | Model for every call, via `--model`. Code default is `sonnet`; set to `haiku` here. |
 | `BATCH_SIZE`, `NIGHTLY_CALLS`, `TOPUP_MAX_CALLS` | Cards per call and call caps (defaults 5 / 5 / 3) |
 | `BUFFER_TARGET`, `RARE_RATE` | 100 unseen cards; 8% rare |
+| `LESSON_BUFFER_TARGET`, `LESSON_TOPUP_THRESHOLD` | Unseen lessons that ingest aims for (default 50), and the level under which a top-up calls Claude (default 30) |
 | `PORT` | 8001 |
 
 `NIGHTLY_BATCH` in `.env` is no longer used and can be removed.
@@ -118,12 +132,12 @@ Every call runs in an empty temp directory with these flags:
 
 The environment is reduced to auth plus `PATH` and `HOME`.
 
-Article text sits inside `<article>` tags. Any tag-like text inside it is escaped, so an article can't close the tag early.
+Article text (for the on-demand quiz) sits inside `<article>` tags. Any tag-like text inside it is escaped, so an article can't close the tag early.
 
 Validation and sanitizing:
 
-- **News sources:** every news card links its article URL. The quote is kept only if it appears verbatim in the article; otherwise the source is `{label: feed name, url}` with no quote. Lesson cards never carry a source.
-- **Article text:** when a feed summary is thin, ingest fetches the page and keeps only the article body, using trafilatura (no menus, ads or comments).
+- **News sources:** every news card links its article URL. Article cards use `{label: feed name, url, quote: null}`. Older model-written news cards kept a quote only if it appeared verbatim in the article. Lesson cards never carry a source.
+- **Fetching pages:** feed and article URLs are untrusted. `fetch.py` allows only http(s) to public addresses, checking every redirect too, so a feed can't point the server at the LAN, the tailnet or localhost. It also enforces timeouts and a size cap (2 MB for article pages, 10 MB for feeds).
 - **SVG:** the sanitizer strips scripts, `foreignObject`, `on*` attributes, external hrefs, and `url()` in styles.
 - **Mermaid:** `click` and `%%{init}` lines are removed.
 
@@ -139,6 +153,7 @@ curl -s http://127.0.0.1:18002/review
 
 ## Design notes
 
+- **Feed:** `/feed` returns every card, newest first, seen or not, each with `seen`. Due reviews are mixed in. `?unseen_only=true` gives the old unseen-only feed.
 - **Review queue:** cards enter it from a wrong quiz answer (due tomorrow), from saving a card, or from "Make it a flashcard" in Ask. Correct answers don't enrol a card.
 - **SM-2 ratings:** Again re-shows the card in 10 min. Hard halves the SM-2 interval and Easy doubles it, so the four buttons show different times.
 - **Levels:** you start at level 1. Going from level n to n+1 costs `100 + 50*n` XP.

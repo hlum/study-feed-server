@@ -15,9 +15,11 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 import progress as P
-from cards import LIMITS, is_rfc_source
+from cards import LIMITS, Invalid, is_rfc_source, validate_quiz
 from core import (TOPICS, ClaudeError, ask_claude, claude_args, claude_env, connect, defang, fill,
-                  init_db, iso, load_prompt, meta_get, now, parse_json_reply, start_of_day)
+                  init_db, is_japanese, iso, load_prompt, meta_get, now, parse_json_reply,
+                  start_of_day)
+from fetch import FetchError, reader_view
 
 log = logging.getLogger("studyfeed.app")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -56,6 +58,7 @@ def card_out(row, is_review: bool | None = None) -> dict:
     card.setdefault("kind", "news" if row["source_id"] else "lesson")
     card.setdefault("lang", "en")
     card.setdefault("site", None)
+    card["seen"] = row["seen_at"] is not None
     if is_review is not None:
         card["is_review"] = is_review
     return card
@@ -80,27 +83,54 @@ def due_rows(con, limit=None, exclude=()):
 
 # ---------- feed ----------
 
+def mix_reviews(con, page: list, limit: int):
+    """Mix about 1 in 6 due reviews into a page of feed rows, picked at random so pages
+    don't repeat one. Returns (cards, id of the last feed row that made it onto the page,
+    the due rows not used)."""
+    used = {r["id"] for r in page}
+    due = list(due_rows(con, exclude=tuple(used)))
+    random.shuffle(due)
+    out, last = [], None
+    for r in page:
+        if len(out) >= limit:
+            break
+        if len(out) % 6 == 5 and due:
+            out.append(card_out(due.pop(), True))
+            if len(out) >= limit:
+                break
+        out.append(card_out(r, False))
+        last = r["id"]
+    return out, last, due
+
+
 @app.get("/feed")
-def feed(cursor: int | None = None, limit: int = Query(10, ge=1, le=50)):
+def feed(cursor: int | None = None, limit: int = Query(10, ge=1, le=50), unseen_only: bool = False):
+    if unseen_only:
+        return feed_unseen(cursor, limit)
+    with db() as con:
+        before = cursor if cursor is not None else 2**62
+        page = con.execute("SELECT * FROM cards WHERE id < ? ORDER BY id DESC LIMIT ?",
+                           (before, limit)).fetchall()
+        out, last, due = mix_reviews(con, page, limit)
+        more = last is not None and con.execute("SELECT 1 FROM cards WHERE id < ? LIMIT 1",
+                                                (last,)).fetchone()
+        if not more:
+            # Oldest card reached: fill the page with due reviews, then stop paging.
+            for r in due[:limit - len(out)]:
+                out.append(card_out(r, True))
+        return {"cards": out, "next_cursor": last if more else None}
+
+
+def feed_unseen(cursor: int | None, limit: int):
+    """The old feed: newest unseen first; when they run out, due reviews, then the oldest
+    seen-but-not-mastered cards. Never empty while any cards exist."""
     with db() as con:
         unseen = con.execute(
             "SELECT * FROM cards WHERE seen_at IS NULL AND id < ? ORDER BY id DESC LIMIT ?",
             (cursor if cursor is not None else 2**62, limit)).fetchall()
-        next_cursor = unseen[-1]["id"] if unseen else None
-        out = [card_out(r, False) for r in unseen]
-        used = {r["id"] for r in unseen}
-
-        # About 1 in 6 items is a due review, picked at random so pages don't repeat it.
-        due = list(due_rows(con, exclude=tuple(used)))
-        random.shuffle(due)
-        mixed = []
-        for c in out:
-            if len(mixed) % 6 == 5 and due:
-                r = due.pop()
-                mixed.append(card_out(r, True))
-                used.add(r["id"])
-            mixed.append(c)
-        out = mixed[:limit]
+        out, last, due = mix_reviews(con, unseen, limit)
+        next_cursor = last
+        used = {c["id"] for c in out}
 
         # Unseen ran out: due reviews, then oldest seen-but-not-mastered, then anything.
         if len(out) < limit:
@@ -155,12 +185,13 @@ class React(BaseModel):
 @app.post("/react")
 def react(body: React):
     with db() as con:
-        get_card_row(con, body.card_id)
+        card = json.loads(get_card_row(con, body.card_id)["data"])
         if body.on:
             con.execute("INSERT OR IGNORE INTO reactions (card_id, kind, at) VALUES (?, ?, ?)",
                         (body.card_id, body.kind, iso(now())))
-            # Saving a card enrols it in spaced repetition.
-            if body.kind == "save" and not con.execute(
+            # Saving a card enrols it in spaced repetition, if it has something to review
+            # (an article has no flashcard, and a quiz only once one was asked for).
+            if body.kind == "save" and (card.get("flashcard") or card.get("quiz")) and not con.execute(
                     "SELECT 1 FROM reviews WHERE card_id = ?", (body.card_id,)).fetchone():
                 P.schedule_tomorrow(con, body.card_id, lapse=False)
         else:
@@ -189,9 +220,11 @@ def stories():
     out = []
     with db() as con:
         for topic in TOPICS:
+            # Newest unseen poster or post; else the newest unseen article; else the newest seen.
             row = con.execute(
-                "SELECT * FROM cards WHERE topic = ? AND card_type IN ('poster','post') "
-                "ORDER BY (seen_at IS NULL) DESC, id DESC LIMIT 1", (topic,)).fetchone()
+                "SELECT * FROM cards WHERE topic = ? AND card_type IN ('poster', 'post', 'article') "
+                "ORDER BY (seen_at IS NULL) DESC, (card_type != 'article') DESC, id DESC LIMIT 1",
+                (topic,)).fetchone()
             if row:
                 out.append({"topic": topic, "card_id": row["id"],
                             "preview": preview_text(json.loads(row["data"])["title"]),
@@ -211,6 +244,8 @@ def answer(body: Answer):
     with db() as con:
         row = get_card_row(con, body.card_id)
         card = json.loads(row["data"])
+        if not card.get("quiz"):
+            raise HTTPException(409, "this card has no quiz yet (POST /cards/{id}/quiz makes one)")
         if not 0 <= body.choice < len(card["quiz"]["options"]):
             raise HTTPException(422, "choice out of range")
         rare = bool(row["rare"])
@@ -339,6 +374,98 @@ def deeper(card_id: int):
         return {"markdown": md}
 
 
+# ---------- reader / on-demand quiz ----------
+
+def card_locks(table: dict, card_id: int) -> threading.Lock:
+    with _locks_guard:
+        return table.setdefault(card_id, threading.Lock())
+
+
+_reader_locks: dict[int, threading.Lock] = {}
+_quiz_locks: dict[int, threading.Lock] = {}
+
+
+def reader_for(card_id: int) -> dict:
+    """The card's article as plain text, fetched and extracted once, then served from
+    the readers table. text is None when the page couldn't be fetched or read."""
+    with card_locks(_reader_locks, card_id):
+        with db() as con:
+            card = json.loads(get_card_row(con, card_id)["data"])
+            cached = con.execute("SELECT * FROM readers WHERE card_id = ?", (card_id,)).fetchone()
+        url = (card.get("source") or {}).get("url")
+        out = {"title": card["title"], "site": card.get("site"), "url": url, "text": None}
+        if cached:
+            return {**out, "title": cached["title"] or card["title"], "text": cached["text"]}
+        if not url:
+            return out
+        try:
+            view = reader_view(url)
+        except FetchError as e:
+            log.info("reader: could not fetch card %d (%s): %s", card_id, url, e)
+            return out
+        except Exception as e:  # trafilatura on a strange page
+            log.warning("reader: extraction failed for card %d (%s): %s", card_id, url, e)
+            return out
+        if not view:
+            log.info("reader: no readable text for card %d (%s)", card_id, url)
+            return out
+        with db() as con:
+            con.execute("INSERT OR REPLACE INTO readers (card_id, title, url, text, fetched_at) "
+                        "VALUES (?, ?, ?, ?, ?)", (card_id, view["title"], url, view["text"], iso(now())))
+        return {**out, "title": view["title"] or card["title"], "text": view["text"]}
+
+
+@app.get("/cards/{card_id}/reader")
+def reader(card_id: int):
+    return reader_for(card_id)
+
+
+QUIZ_TEXT_CHARS = 6000  # of the article, for the quiz prompt
+
+
+@app.post("/cards/{card_id}/quiz")
+def make_quiz(card_id: int):
+    """A quiz for a card that has none (feed articles), made once with one model call
+    and saved on the card. Cards that already have a quiz return it without a call."""
+    with card_locks(_quiz_locks, card_id):
+        with db() as con:
+            card = json.loads(get_card_row(con, card_id)["data"])
+        if card.get("quiz"):
+            return {"quiz": card["quiz"]}
+        lang = card.get("lang", "en")
+        text = reader_for(card_id)["text"] or card["body"]
+        lim = LIMITS[lang]
+        limits = (f"- question: {lim['question']} characters or fewer\n"
+                  f"- each option: {lim['option']} characters or fewer\n"
+                  f"- explanation: {lim['explanation']} characters or fewer")
+        rule = ("- Write everything in Japanese (です・ます調), keeping common technical terms such as "
+                "API, async/await and SwiftUI in English." if lang == "ja" else "- Write in English.")
+        url = (card.get("source") or {}).get("url") or ""
+        prompt = fill(load_prompt("article_quiz.md"), url=defang(url).replace('"', "%22"), lang=lang,
+                      title=defang(card["title"]), text=defang(text[:QUIZ_TEXT_CHARS]),
+                      limits=limits, language_rule=rule)
+        try:
+            quiz = validate_quiz(parse_json_reply(ask_claude(prompt)), lang)
+            if len({o.strip().lower() for o in quiz["options"]}) < 4:
+                raise Invalid("duplicate options")
+            if lang == "ja" and not is_japanese(quiz["question"] + quiz["explanation"]):
+                raise Invalid("quiz for a Japanese article is not in Japanese")
+        except ClaudeError as e:
+            log.error("quiz failed for card %d: %s", card_id, e)
+            raise HTTPException(503, "Claude is unavailable right now (usage limit?). Try later."
+                                if e.limited else "Could not make a quiz.")
+        except (Invalid, ValueError, TypeError, AttributeError) as e:
+            log.warning("quiz for card %d rejected: %s", card_id, e)
+            raise HTTPException(502, "Could not make a valid quiz. Try again.")
+        with db() as con:
+            # Re-read so a concurrent change to the card (e.g. deeper) isn't overwritten.
+            row = get_card_row(con, card_id)
+            data = json.loads(row["data"])
+            data["quiz"] = quiz
+            con.execute("UPDATE cards SET data = ? WHERE id = ?", (json.dumps(data), card_id))
+        return {"quiz": quiz}
+
+
 # ---------- ask ----------
 
 @app.get("/cards/{card_id}/thread")
@@ -383,7 +510,7 @@ def make_flashcard_card(con, parent_id: int, parent: dict, fc: dict) -> int:
     card = {**parent, "card_type": "post", "part": None, "parts_total": None,
             "title": front[:lim["title"]], "body": back[:lim["body"]], "source": None, "slides": [],
             "visual": None, "flashcard": {"front": front[:lim["front"]], "back": back[:lim["back"]]}}
-    for k in ("id", "rare", "created_at", "deeper", "is_review"):
+    for k in ("id", "rare", "created_at", "deeper", "is_review", "seen"):
         card.pop(k, None)
     t = iso(now())
     cur = con.execute("INSERT INTO cards (card_type, topic, series_id, part, rare, data, seen_at, "
@@ -546,5 +673,7 @@ def stats():
 def health():
     with db() as con:
         buf = con.execute("SELECT COUNT(*) FROM cards WHERE seen_at IS NULL").fetchone()[0]
-        return {"ok": True, "buffer": buf, "last_ingest": meta_get(con, "last_ingest"),
+        lessons = con.execute("SELECT COUNT(*) FROM cards WHERE seen_at IS NULL "
+                              "AND json_extract(data, '$.kind') = 'lesson'").fetchone()[0]
+        return {"ok": True, "buffer": buf, "lesson_buffer": lessons, "last_ingest": meta_get(con, "last_ingest"),
                 "last_error": meta_get(con, "last_error")}

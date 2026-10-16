@@ -1,39 +1,48 @@
-"""Generate cards into the buffer. Run by cron; see README.md.
+"""Fill the feed. Run by cron; see README.md.
 
-Each `claude -p` call makes BATCH_SIZE cards (5 articles, or 5 parts of one series).
+Feed articles become `article` cards with no model call (title, summary, link).
+Only lesson cards are written by Claude: each `claude -p` call makes BATCH_SIZE parts of one series.
 
-  python ingest.py --limit 5   # insert N new cards now (ignores the buffer)
-  python ingest.py --nightly   # fill toward BUFFER_TARGET, at most NIGHTLY_CALLS calls
-  python ingest.py --topup     # only if the buffer is under 60, at most TOPUP_MAX_CALLS calls
+  python ingest.py --limit 5        # articles, plus N new lesson cards now (ignores the buffer)
+  python ingest.py --nightly        # articles, plus lessons toward LESSON_BUFFER_TARGET (NIGHTLY_CALLS calls)
+  python ingest.py --topup          # articles, plus lessons if under LESSON_TOPUP_THRESHOLD (TOPUP_MAX_CALLS)
+  python ingest.py --articles-only  # articles only, zero model calls
 """
 import argparse
+import calendar
 import fcntl
 import hashlib
 import html
 import json
 import logging
+import os
 import random
 import re
 import sys
-import urllib.request
 from collections import Counter
-from urllib.parse import urlparse
+from datetime import datetime
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import feedparser
-import trafilatura
 
-from cards import (Invalid, length_problems, quality_problems, quote_is_verbatim, shorten_card,
-                   validate_card)
+from cards import Invalid, length_problems, quality_problems, shorten_card, shorten_text, validate_card
 from core import (BATCH_SIZE, BUFFER_TARGET, CLAUDE_MODEL, LOG_DIR, NIGHTLY_CALLS, RARE_RATE, ROOT,
-                  TOPUP_MAX_CALLS, TOPUP_THRESHOLD,
-                  ClaudeError, ask_claude, connect, defang, fill, init_db, is_japanese, iso,
+                  TOPICS, TOPUP_MAX_CALLS, TOPUP_THRESHOLD,
+                  ClaudeError, ask_claude, connect, defang, fill, has_japanese, init_db, iso,
                   load_feeds, load_prompt, site_name,
                   meta_get, meta_set, now, parse_json_reply)
+from fetch import FEED_MAX_BYTES, FetchError, http_get
 
 log = logging.getLogger("studyfeed.ingest")
-UA = "StudyFeed/1.0 (personal RSS reader)"
-MAX_BYTES = 2_000_000
-ARTICLE_CHARS = 4000  # per article; 5 articles share one prompt
+
+# Articles cost nothing, so the buffer that drives Claude calls counts unseen lessons only.
+# Before articles, about half of the 100-card buffer was lessons; keep that share.
+LESSON_BUFFER_TARGET = int(os.getenv("LESSON_BUFFER_TARGET", str(BUFFER_TARGET // 2)))
+LESSON_TOPUP_THRESHOLD = int(os.getenv("LESSON_TOPUP_THRESHOLD", str(TOPUP_THRESHOLD // 2)))
+ARTICLES_PER_FEED = 5           # new items per feed per run, so no site floods the feed
+ARTICLE_DEFAULT_TOPIC = "swe"   # feeds.txt lines without a topic tag
+ARTICLE_BODY = {"en": 280, "ja": 140}
+ARTICLE_TITLE_MAX = 200         # feed titles are kept as written; this only stops runaway ones
 
 # Roadmap file (roadmaps/<name>.md) -> card topic.
 ROADMAPS = {"networking": "networking", "security": "security", "ai": "ai", "swe": "swe",
@@ -63,12 +72,9 @@ def load_roadmap(topic: str) -> list[dict]:
     return items
 
 
-# ---------- feeds ----------
+# ---------- articles (no model) ----------
 
-def http_get(url: str, timeout: int = 15) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read(MAX_BYTES)
+BLOCK_TAGS = re.compile(r"(?i)<\s*(/?(p|div|li|ul|ol|h[1-6]|blockquote|pre|table|tr|section|article)\b[^>]*|br\s*/?)>")
 
 
 def html_to_text(s: str) -> str:
@@ -77,66 +83,168 @@ def html_to_text(s: str) -> str:
     return re.sub(r"\s+", " ", html.unescape(s)).strip()
 
 
+def html_paragraphs(s: str) -> list[str]:
+    """Plain-text paragraphs of an HTML fragment, in order."""
+    s = re.sub(r"(?is)<(script|style|noscript|svg|figure|figcaption)\b.*?</\1>", " ", s or "")
+    s = BLOCK_TAGS.sub("\n\n", s)
+    return [p for p in (html_to_text(x) for x in re.split(r"\n\s*\n", s)) if p]
+
+
+# Aggregator boilerplate that is not the article's text (hnrss, Lobsters, arXiv).
+BOILERPLATE = [re.compile(p, re.I) for p in (
+    r"^(Article URL|Comments URL|Points|# Comments):.*$",
+    r"^Comments$",
+    r"^arXiv:\S+\s+Announce Type:\s*\S+\s*(Abstract:\s*)?",
+)]
+
+
+def strip_boilerplate(paragraphs: list[str]) -> list[str]:
+    out = []
+    for p in paragraphs:
+        for pat in BOILERPLATE:
+            p = pat.sub("", p).strip()
+        if p:
+            out.append(p)
+    return out
+
+
+def cut_text(text: str, max_len: int) -> str:
+    """Whole sentences up to about max_len; if even the first is longer, cut at a word
+    (or, for Japanese, a character) and add an ellipsis."""
+    text = text.strip()
+    if len(text) <= max_len:
+        return text
+    short = shorten_text(text, max_len)
+    if short:
+        return short
+    cut = text[:max_len - 1]
+    if " " in cut[max_len // 2:]:
+        cut = cut.rsplit(" ", 1)[0]
+    return cut.rstrip(" ,.;:、。") + "…"
+
+
+def entry_body(e) -> str:
+    """The feed's own summary, or else the first paragraph of its content."""
+    paragraphs = strip_boilerplate(html_paragraphs(e.get("summary") or ""))
+    if not paragraphs:
+        for c in e.get("content") or []:
+            paragraphs = strip_boilerplate(html_paragraphs(c.get("value", "")))[:1]
+            if paragraphs:
+                break
+    return " ".join(paragraphs)
+
+
+def entry_published(e) -> str | None:
+    t = e.get("published_parsed") or e.get("updated_parsed")
+    if not t:
+        return None
+    try:  # feedparser gives UTC; the API uses server-local time
+        return iso(datetime.fromtimestamp(calendar.timegm(t)))
+    except (OverflowError, ValueError, OSError):
+        return None
+
+
+TRACKING = re.compile(r"^(utm_\w+|fbclid|gclid|ref|source)$", re.I)
+
+
+def normalize_url(url: str) -> str:
+    """Same article, same key: no fragment, no tracking parameters, no trailing slash."""
+    p = urlparse(url.strip())
+    query = urlencode([(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
+                       if not TRACKING.match(k)])
+    return urlunparse((p.scheme.lower(), (p.hostname or "").lower() + (f":{p.port}" if p.port else ""),
+                       p.path.rstrip("/") or "/", "", query, ""))
+
+
 def url_hash(url: str) -> str:
     return hashlib.sha256(url.strip().encode()).hexdigest()
 
 
-def candidate_items(con) -> list[dict]:
-    """New feed entries, round-robin across feeds so one feed can't dominate."""
+def title_key(title: str) -> str:
+    return re.sub(r"[\W_]+", "", title.lower())
+
+
+def article_topic(tags: set[str]) -> str:
+    return next((t for t in TOPICS if t in tags), ARTICLE_DEFAULT_TOPIC)
+
+
+def article_card(entry, feed_name: str, tags: set[str], url: str) -> dict:
+    title = html_to_text(entry.get("title", ""))
+    body = re.sub(r"^!\s+", "", entry_body(entry))  # Zenn callout marker
+    if title and body.startswith(title):
+        body = body[len(title):].lstrip(" :：-–—／|")  # summary that opens with the title again
+    if title_key(body) == title_key(title):
+        body = ""  # only repeats the title: no text of its own
+    lang = "ja" if has_japanese(title + " " + body) else "en"
+    return {"card_type": "article", "topic": article_topic(tags), "series_id": None, "part": None,
+            "parts_total": None, "title": cut_text(title, ARTICLE_TITLE_MAX) if title else "",
+            "body": cut_text(body, ARTICLE_BODY[lang]) if body else "",
+            "source": {"label": feed_name, "url": url, "quote": None},
+            "slides": [], "visual": None, "cliffhanger": None, "quiz": None, "flashcard": None,
+            "kind": "news", "lang": lang, "site": site_name(url),
+            "published_at": entry_published(entry)}
+
+
+def ingest_articles(con) -> Counter:
+    """Insert new feed items as article cards (no model). Each feed gives at most
+    ARTICLES_PER_FEED new items; feeds are interleaved so ids don't cluster by site."""
+    stats: Counter = Counter()
+    seen_titles = {title_key(r[0]) for r in con.execute(
+        "SELECT json_extract(data, '$.title') FROM cards WHERE json_extract(data, '$.kind') = 'news'")}
     per_feed = []
     for feed, tags in load_feeds():
         try:
-            parsed = feedparser.parse(http_get(feed))
+            parsed = feedparser.parse(http_get(feed, max_bytes=FEED_MAX_BYTES))
             if parsed.bozo and not parsed.entries:
                 raise ValueError(str(parsed.bozo_exception))
-        except Exception as e:
+        except (FetchError, ValueError) as e:
             log.warning("feed failed, skipping: %s (%s)", feed, e)
+            stats["feeds_failed"] += 1
             continue
-        feed_name = html_to_text(parsed.feed.get("title", "")) or urlparse(feed).hostname or feed
+        feed_name = (html_to_text(parsed.feed.get("title", "")) or urlparse(feed).hostname or feed)[:120]
         fresh = []
-        for e in parsed.entries[:15]:
-            link = e.get("link")
-            if not link or con.execute("SELECT 1 FROM sources WHERE url_hash = ?",
-                                       (url_hash(link),)).fetchone():
+        for e in parsed.entries:
+            if len(fresh) >= ARTICLES_PER_FEED:
+                break  # the rest stay unrecorded, so a later run can still pick them up
+            link = (e.get("link") or "").strip()
+            if not link.startswith(("http://", "https://")):
                 continue
-            summary = e.get("summary") or ""
-            if e.get("content"):
-                summary = max((c.get("value", "") for c in e.content), key=len, default=summary)
-            fresh.append({"url": link, "feed": feed, "feed_name": feed_name[:120], "ios": "ios" in tags,
-                          "title": html_to_text(e.get("title", "")),
-                          "text": html_to_text(summary)})
+            norm = normalize_url(link)
+            if con.execute("SELECT 1 FROM sources WHERE url_hash IN (?, ?)",
+                           (url_hash(link), url_hash(norm))).fetchone():
+                stats["duplicate"] += 1
+                continue
+            card = article_card(e, feed_name, tags, link)
+            if not card["title"] or not card["body"]:
+                stats["empty"] += 1
+                continue
+            key = title_key(card["title"])
+            if key in seen_titles:  # e.g. the same post via Hacker News and Lobsters
+                stats["duplicate"] += 1
+                continue
+            seen_titles.add(key)
+            fresh.append((feed, norm, card))
         per_feed.append(fresh)
-    # A news call takes only BATCH_SIZE items, so a fixed order would always favour the
-    # feeds at the top of feeds.txt. Shuffle so every feed gets a turn.
     random.shuffle(per_feed)
-    out = []
     while any(per_feed):
         for lst in per_feed:
-            if lst:
-                out.append(lst.pop(0))
-    return out
-
-
-def extract_article(page: bytes, url: str) -> str | None:
-    """Main article body only (no menus, ads or comments), via trafilatura."""
-    body = trafilatura.extract(page, url=url, include_comments=False, include_images=False,
-                               include_links=False, deduplicate=True)
-    return re.sub(r"\s+", " ", body).strip() if body else None
-
-
-def article_text(item: dict) -> str:
-    """Feed summary, or the article body itself when the summary is too thin (e.g. HN links)."""
-    text = item["text"]
-    if len(text) < 400:
-        try:
-            body = extract_article(http_get(item["url"]), item["url"])
-            if body:
-                text = (text + " " + body).strip()
-            else:
-                log.info("no article body found at %s; using the feed summary", item["url"])
-        except Exception as e:
-            log.info("could not fetch article %s (%s)", item["url"], e)
-    return text[:ARTICLE_CHARS]
+            if not lst:
+                continue
+            feed, norm, card = lst.pop(0)
+            cur = con.execute("INSERT OR IGNORE INTO sources (url_hash, url, feed, fetched_at) "
+                              "VALUES (?, ?, ?, ?)", (url_hash(norm), norm, feed, iso(now())))
+            if not cur.rowcount:
+                stats["duplicate"] += 1
+                continue
+            insert_card(con, card, cur.lastrowid)
+            stats["inserted"] += 1
+            stats[f"lang_{card['lang']}"] += 1
+    con.commit()
+    log.info("articles: inserted %d with 0 model calls (en %d, ja %d, at most %d per feed); "
+             "skipped %d duplicates and %d with no title or text; %d feeds failed",
+             stats["inserted"], stats["lang_en"], stats["lang_ja"], ARTICLES_PER_FEED,
+             stats["duplicate"], stats["empty"], stats["feeds_failed"])
+    return stats
 
 
 # ---------- card generation ----------
@@ -166,31 +274,6 @@ def insert_card(con, card: dict, source_id=None) -> int:
         (card["card_type"], card["topic"], card["series_id"], card["part"], rare,
          json.dumps(card), source_id, iso(now())))
     return cur.lastrowid
-
-
-def article_block(n: int, item: dict) -> str:
-    url = defang(item["url"]).replace('"', "%22")
-    feed = defang(item["feed"]).replace('"', "%22")
-    return (f'<article n="{n}" url="{url}" feed="{feed}" lang="{item["lang"]}">\n{defang(item["title"])}\n\n'
-            f'{defang(item["text"])}\n</article>')
-
-
-def news_source(model_src, item: dict, problems: list) -> dict | None:
-    """Every news card links its article. The model's label and quote are kept only when
-    the quote appears verbatim in the article; otherwise the source is {feed name, url}."""
-    url = item["url"]
-    if not url.startswith(("http://", "https://")):
-        problems.append("no source: article url is not http(s)")
-        return None
-    src = model_src if isinstance(model_src, dict) else {}
-    label, quote = src.get("label"), src.get("quote")
-    if (isinstance(label, str) and 0 < len(label.strip()) <= 120
-            and isinstance(quote, str) and len(quote.strip()) <= 600
-            and quote_is_verbatim(quote, item["title"] + " " + item["text"])):
-        return {"label": label.strip(), "quote": quote.strip(), "url": url}
-    if quote:
-        problems.append("dropped quote: not found verbatim in article")
-    return {"label": item["feed_name"], "url": url}
 
 
 class Run:
@@ -307,80 +390,6 @@ def finish_card(run: Run, raw: dict, lang: str, kind: str, label: str, retry):
     return None, None
 
 
-def make_news_cards(con, run: Run, items: list[dict]) -> list[int]:
-    """One call for up to BATCH_SIZE articles. Returns new card ids. Raises ClaudeError."""
-    for it in items:
-        it["text"] = article_text(it)
-        # Each article's own language; a card is never judged by the rest of its batch.
-        it["lang"] = "ja" if is_japanese(it["title"] + " " + it["text"]) else "en"
-    template = load_prompt("news_card.md")
-    reply = run.call(fill(template, articles="\n\n".join(article_block(i + 1, it)
-                                                          for i, it in enumerate(items))) + visual_shapes())
-
-    # The call succeeded: mark every article used whatever the outcome, so none loops forever.
-    source_ids = []
-    for it in items:
-        cur = con.execute("INSERT OR IGNORE INTO sources (url_hash, url, feed, fetched_at) "
-                          "VALUES (?, ?, ?, ?)", (url_hash(it["url"]), it["url"], it["feed"], iso(now())))
-        source_ids.append(cur.lastrowid if cur.rowcount else None)
-    con.commit()
-    try:
-        entries = parse_json_reply(reply, "[")
-        if not isinstance(entries, list):
-            raise ValueError("reply is not a JSON array")
-    except ValueError as e:
-        run.drop("news-batch", f"bad reply: {e}", "whole batch", reply)
-        return []
-    if len(entries) != len(items):
-        log.warning("news reply has %d entries for %d articles; matching by source url",
-                    len(entries), len(items))
-    by_url = {it["url"]: i for i, it in enumerate(items)}
-
-    def prepare(raw: dict) -> dict:
-        # The server builds the source itself (below), so a bad one never drops the card.
-        raw = dict(raw)
-        raw["_source"] = raw.pop("source", None)
-        raw.update(source=None, series_id=None, part=None, parts_total=None)
-        return raw
-
-    ids = []
-    for pos, raw in enumerate(entries):
-        if isinstance(raw, dict) and raw.get("skip") is True:
-            run.stats["skipped"] += 1
-            if len(entries) == len(items):
-                log.info("skipped (not IT / too thin): %s", items[pos]["url"])
-            continue
-        if not isinstance(raw, dict):
-            run.drop("news", "entry is not an object", "news", raw)
-            continue
-        i = pos if len(entries) == len(items) else by_url.get((raw.get("source") or {}).get("url"))
-        if i is None:
-            run.drop("news", "cannot match card to an article", "news", raw)
-            continue
-        item = items[i]
-
-        def retry(bad: dict, over: list[str], item=item) -> dict | None:
-            new = first_card(run.call(fill(template, articles=article_block(1, item))
-                                      + visual_shapes() + retry_note(bad, over, "ARTICLE")))
-            return prepare(new) if isinstance(new, dict) and new.get("skip") is not True else new
-
-        result, used = finish_card(run, prepare(raw), item["lang"], "news",
-                                   f"{item['url']} [{item['lang']}]", retry)
-        if result is None:
-            continue
-        card, problems = result
-        card["source"] = news_source(used.get("_source"), item, problems)
-        if item["ios"]:
-            card["topic"] = "ios"  # cards from [ios] feeds are always iOS
-        # Language comes from this card's own article, never from the rest of the batch.
-        card.update(kind="news", lang=item["lang"], site=site_name(item["url"]))
-        for p in problems:
-            log.info("news card fix: %s", p)
-        ids.append(insert_card(con, card, source_ids[i]))
-        con.commit()
-    return ids
-
-
 def make_lesson_cards(con, run: Run, roadmap: str, count: int):
     """One call for the next `count` parts of the current series in roadmaps/<roadmap>.md
     (never crossing into the next series). Returns new card ids, or None if it is finished.
@@ -462,82 +471,61 @@ def make_lesson_cards(con, run: Run, roadmap: str, count: int):
 
 # ---------- batch ----------
 
-def buffer_size(con) -> int:
-    return con.execute("SELECT COUNT(*) FROM cards WHERE seen_at IS NULL").fetchone()[0]
+def lesson_buffer(con) -> int:
+    return con.execute("SELECT COUNT(*) FROM cards WHERE seen_at IS NULL "
+                       "AND json_extract(data, '$.kind') = 'lesson'").fetchone()[0]
 
 
 def run(target: int, max_calls: int, exact: bool) -> int:
-    """Alternate news and lesson calls until `target` cards are in or `max_calls` are spent
+    """Lesson calls, rotating roadmaps, until `target` cards are in or `max_calls` are spent
     (retries count too). With `exact`, each call asks only for the cards still needed."""
     global LAST_RUN
     con = connect()
     r = LAST_RUN = Run(max_calls)
     inserted = 0
-    news_queue = None
     turn = int(meta_get(con, "lesson_rotation", "0"))
     roadmaps = set(LESSON_ROTATION)
-    want_news = meta_get(con, "next_is_news", "1") == "1"
     done: set[str] = set()
-    news_empty = False
     try:
         while inserted < target and r.can_call():
-            if news_empty and done == roadmaps:
-                log.warning("no new feed items and all roadmaps finished; stopping")
+            if done == roadmaps:
+                log.warning("all roadmaps finished; add items to roadmaps/*.md")
                 break
             count = min(BATCH_SIZE, target - inserted) if exact else BATCH_SIZE
-            if want_news and not news_empty:
-                if news_queue is None:
-                    news_queue = candidate_items(con)
-                    log.info("%d new feed items available", len(news_queue))
-                if not news_queue:
-                    news_empty = True
-                    want_news = False
-                    continue
-                batch, news_queue = news_queue[:count], news_queue[count:]
-                ids = make_news_cards(con, r, batch)
-                kind = "news"
-            else:
-                if done == roadmaps:
-                    want_news = True  # every roadmap finished: news only
-                    continue
-                roadmap = LESSON_ROTATION[turn % len(LESSON_ROTATION)]
-                turn += 1
-                meta_set(con, "lesson_rotation", str(turn % len(LESSON_ROTATION)))
-                if roadmap in done:
-                    continue
-                ids = make_lesson_cards(con, r, roadmap, count)
-                if ids is None:
-                    log.info("roadmap finished: add items to roadmaps/%s.md", roadmap)
-                    done.add(roadmap)
-                    continue
-                kind = f"lesson/{roadmap}"
+            roadmap = LESSON_ROTATION[turn % len(LESSON_ROTATION)]
+            turn += 1
+            meta_set(con, "lesson_rotation", str(turn % len(LESSON_ROTATION)))
+            if roadmap in done:
+                continue
+            ids = make_lesson_cards(con, r, roadmap, count)
+            if ids is None:
+                log.info("roadmap finished: add items to roadmaps/%s.md", roadmap)
+                done.add(roadmap)
+                continue
             inserted += len(ids)
-            log.info("after call %d (%s): inserted %d cards %s", r.calls, kind, len(ids), ids)
-            want_news = not want_news
-            meta_set(con, "next_is_news", "1" if want_news else "0")
+            log.info("after call %d (lesson/%s): inserted %d cards %s", r.calls, roadmap, len(ids), ids)
             con.commit()
         if r.error:
             raise r.error  # a retry call failed: handled like any failed call below
-        meta_set(con, "last_ingest", iso(now()))
         meta_set(con, "last_error", None)
     except ClaudeError as e:
         # Pro usage limit or any CLI failure: stop the batch, the next cron run retries.
         log.error("stopping after %d cards: %s%s", inserted, e, " (usage limit)" if e.limited else "")
-        meta_set(con, "last_ingest", iso(now()))
         meta_set(con, "last_error", f"{iso(now())} {e}")
     finally:
         con.commit()
         con.close()
-    log.info("summary: %s", r.summary(inserted))
+    log.info("lesson summary: %s", r.summary(inserted))
     return inserted
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     g = ap.add_mutually_exclusive_group(required=True)
-    g.add_argument("--limit", type=int, help="insert exactly N cards")
+    g.add_argument("--limit", type=int, help="insert exactly N lesson cards (plus new articles)")
     g.add_argument("--nightly", action="store_true")
     g.add_argument("--topup", action="store_true")
+    g.add_argument("--articles-only", action="store_true", help="feed articles only, no model calls")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, stream=sys.stdout,
                         format="%(asctime)s %(levelname)s %(message)s")
@@ -551,20 +539,27 @@ def main() -> int:
 
     init_db()
     con = connect()
-    buf = buffer_size(con)
-    con.close()
+    try:
+        ingest_articles(con)
+        buf = lesson_buffer(con)
+        meta_set(con, "last_ingest", iso(now()))
+        con.commit()
+    finally:
+        con.close()
+    if args.articles_only:
+        return 0
     if args.limit is not None:
         target, max_calls = args.limit, args.limit + 2  # bounded even if many cards drop
-    elif args.topup and buf >= TOPUP_THRESHOLD:
-        log.info("buffer %d >= %d, no top-up needed", buf, TOPUP_THRESHOLD)
+    elif args.topup and buf >= LESSON_TOPUP_THRESHOLD:
+        log.info("lesson buffer %d >= %d, no lesson top-up needed", buf, LESSON_TOPUP_THRESHOLD)
         return 0
     else:
-        target = max(0, BUFFER_TARGET - buf)
+        target = max(0, LESSON_BUFFER_TARGET - buf)
         max_calls = TOPUP_MAX_CALLS if args.topup else NIGHTLY_CALLS
-    log.info("buffer %d, want %d cards, at most %d calls (model %s, %d per call)",
+    log.info("lesson buffer %d, want %d lessons, at most %d calls (model %s, %d per call)",
              buf, target, max_calls, CLAUDE_MODEL, BATCH_SIZE)
     n = run(target, max_calls, exact=args.limit is not None) if target > 0 else 0
-    log.info("done: inserted %d", n)
+    log.info("done: inserted %d lesson cards", n)
     return 0
 
 

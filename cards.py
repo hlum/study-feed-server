@@ -232,18 +232,7 @@ def validate_card(raw: dict, problems: list | None = None, lang: str = "en") -> 
     else:
         c["visual"] = _soft_visual(raw.get("visual"), problems)
 
-    q = raw.get("quiz")
-    if not isinstance(q, dict):
-        raise Invalid("quiz is required")
-    options = q.get("options")
-    if not isinstance(options, list) or len(options) != 4:
-        raise Invalid("quiz needs exactly 4 options")
-    c["quiz"] = {"question": _str(q.get("question"), "quiz.question", lim["question"]),
-                 "options": [_str(o, "quiz.option", lim["option"]) for o in options],
-                 "answer": _answer_index(q.get("answer"), options),
-                 "explanation": _str(q.get("explanation"), "quiz.explanation", lim["explanation"])}
-    if not 0 <= c["quiz"]["answer"] <= 3:
-        raise Invalid("quiz.answer must be 0-3")
+    c["quiz"] = validate_quiz(raw.get("quiz"), lang)
 
     f = raw.get("flashcard")
     if not isinstance(f, dict):
@@ -258,6 +247,22 @@ def validate_card(raw: dict, problems: list | None = None, lang: str = "en") -> 
         if not_ja:
             raise Invalid("card for a Japanese article is not in Japanese: " + ", ".join(not_ja))
     return c
+
+
+def validate_quiz(q, lang: str = "en") -> dict:
+    lim = LIMITS[lang]
+    if not isinstance(q, dict):
+        raise Invalid("quiz is required")
+    options = q.get("options")
+    if not isinstance(options, list) or len(options) != 4:
+        raise Invalid("quiz needs exactly 4 options")
+    quiz = {"question": _str(q.get("question"), "quiz.question", lim["question"]),
+            "options": [_str(o, "quiz.option", lim["option"]) for o in options],
+            "answer": _answer_index(q.get("answer"), options),
+            "explanation": _str(q.get("explanation"), "quiz.explanation", lim["explanation"])}
+    if not 0 <= quiz["answer"] <= 3:
+        raise Invalid("quiz.answer must be 0-3")
+    return quiz
 
 
 def _answer_index(answer, options) -> int:

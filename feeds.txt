@@ -1,29 +1,30 @@
 # One RSS/Atom URL per line. Lines starting with # are ignored.
-# Add [ios] after a URL for feeds about iOS: their cards get topic "ios".
+# Add a topic tag after a URL: [ios], [security], [ai], [swe] or [networking].
+# Its article cards get that topic. Untagged feeds get [swe].
 # The owner edits this list. Ingest skips feeds that fail and logs them.
 
 # General tech
-https://hnrss.org/frontpage?points=150
-https://lobste.rs/rss
+https://hnrss.org/frontpage?points=150  [swe]
+https://lobste.rs/rss  [swe]
 
 # Security
-https://krebsonsecurity.com/feed/
-https://www.schneier.com/feed/atom/
-https://portswigger.net/research/rss
+https://krebsonsecurity.com/feed/  [security]
+https://www.schneier.com/feed/atom/  [security]
+https://portswigger.net/research/rss  [security]
 
 # Networking / infra
-https://blog.cloudflare.com/rss/
-https://tailscale.com/blog/index.xml
+https://blog.cloudflare.com/rss/  [networking]
+https://tailscale.com/blog/index.xml  [networking]
 
 # AI / ML
-https://export.arxiv.org/rss/cs.CL
-https://huggingface.co/blog/feed.xml
-https://simonwillison.net/atom/everything/
+https://export.arxiv.org/rss/cs.CL  [ai]
+https://huggingface.co/blog/feed.xml  [ai]
+https://simonwillison.net/atom/everything/  [ai]
 
 # Software engineering
-https://jvns.ca/atom.xml
-https://danluu.com/atom.xml
-https://github.blog/engineering/feed/
+https://jvns.ca/atom.xml  [swe]
+https://danluu.com/atom.xml  [swe]
+https://github.blog/engineering/feed/  [swe]
 
 # iOS / Swift
 https://developer.apple.com/news/rss/news.rss  [ios]
@@ -38,23 +39,23 @@ https://sarunw.com/feed.xml  [ios]
 https://www.polpiella.dev/rss.xml  [ios]
 
 # Japanese: Qiita (popular + iOS tags)
-https://qiita.com/popular-items/feed
+https://qiita.com/popular-items/feed  [swe]
 https://qiita.com/tags/swift/feed  [ios]
 https://qiita.com/tags/ios/feed  [ios]
 https://qiita.com/tags/swiftui/feed  [ios]
 
 # Japanese: Zenn (trending + iOS topics)
-https://zenn.dev/feed
+https://zenn.dev/feed  [swe]
 https://zenn.dev/topics/swift/feed  [ios]
 https://zenn.dev/topics/ios/feed  [ios]
 https://zenn.dev/topics/swiftui/feed  [ios]
 
 # Japanese: news and company tech blogs
-https://b.hatena.ne.jp/hotentry/it.rss
-https://www.publickey1.jp/atom.xml
-https://gihyo.jp/feed/rss2
-https://techlife.cookpad.com/feed
-https://engineering.mercari.com/blog/feed.xml
-https://techblog.lycorp.co.jp/ja/feed/index.xml
-https://developers.cyberagent.co.jp/blog/feed/
-https://engineering.dena.com/index.xml
+https://b.hatena.ne.jp/hotentry/it.rss  [swe]
+https://www.publickey1.jp/atom.xml  [swe]
+https://gihyo.jp/feed/rss2  [swe]
+https://techlife.cookpad.com/feed  [swe]
+https://engineering.mercari.com/blog/feed.xml  [swe]
+https://techblog.lycorp.co.jp/ja/feed/index.xml  [swe]
+https://developers.cyberagent.co.jp/blog/feed/  [swe]
+https://engineering.dena.com/index.xml  [swe]

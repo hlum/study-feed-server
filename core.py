@@ -70,10 +70,15 @@ def init_db() -> None:
 
 def migrate(con) -> None:
     """Idempotent upgrades for databases created by older versions of schema.sql."""
-    # 1. cards.topic CHECK gained 'ios'. SQLite can't alter a CHECK, so rebuild the table
-    #    (official 12-step procedure): copy every row into a new table with the new schema.
+    # 1. cards CHECKs gained topic 'ios' and card_type 'article'. SQLite can't alter a CHECK,
+    #    so rebuild the table (official 12-step procedure): copy every row into a new table
+    #    with the new schema. A copy of the database is kept in logs/ first.
     sql = con.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cards'").fetchone()[0]
-    if "'ios'" not in sql:
+    if "'ios'" not in sql or "'article'" not in sql:
+        backup = LOG_DIR / f"study-before-migration-{datetime.now():%Y%m%d-%H%M%S}.db"
+        with sqlite3.connect(backup) as dst:
+            con.backup(dst)
+        log.warning("backed up the database to %s before migrating cards", backup)
         schema = (ROOT / "schema.sql").read_text()
         create = re.search(r"CREATE TABLE IF NOT EXISTS cards \(.*?\n\);", schema, re.S).group(0)
         before = con.execute("SELECT COUNT(*) FROM cards").fetchone()[0]
@@ -95,7 +100,7 @@ def migrate(con) -> None:
             raise
         finally:
             con.execute("PRAGMA foreign_keys = ON")
-        log.warning("migrated cards table: topic may now be 'ios' (%d cards kept)", after)
+        log.warning("migrated cards table to the current CHECKs (%d cards kept)", after)
 
     # 2. Cards gained kind/lang/site. Fill them in for older cards, and move iOS
     #    lessons and cards from [ios] feeds to the new "ios" topic.
@@ -150,7 +155,8 @@ SITE_NAMES = {
     "developer.apple.com": "Apple Developer", "swiftbysundell.com": "Swift by Sundell",
     "hackingwithswift.com": "Hacking with Swift", "avanderlee.com": "SwiftLee",
     "donnywals.com": "Donny Wals", "nshipster.com": "NSHipster", "useyourloaf.com": "Use Your Loaf",
-    "iosdevweekly.com": "iOS Dev Weekly", "sarunw.com": "Sarunw", "polpiella.dev": "Pol Piella",
+    "iosdevweekly.com": "iOS Dev Weekly",
+    "main--iosdevweekly.netlify.app": "iOS Dev Weekly", "sarunw.com": "Sarunw", "polpiella.dev": "Pol Piella",
     "news.ycombinator.com": "Hacker News", "lobste.rs": "Lobsters",
     "krebsonsecurity.com": "Krebs on Security", "schneier.com": "Schneier on Security",
     "portswigger.net": "PortSwigger Research", "blog.cloudflare.com": "Cloudflare Blog",
@@ -192,6 +198,14 @@ def is_japanese(text: str) -> bool:
     sample = (text or "")[:3000]
     kana = len(_KANA.findall(sample))
     return kana >= 10 or (kana >= 2 and kana >= len(sample) * 0.05)
+
+
+_JA_CHARS = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uff66-\uff9f]")
+
+
+def has_japanese(text: str) -> bool:
+    """Any hiragana, katakana or kanji. Used for feed articles, where no model checks the text."""
+    return bool(_JA_CHARS.search(text or ""))
 
 
 def meta_get(con, key, default=None):

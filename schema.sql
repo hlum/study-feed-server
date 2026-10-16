@@ -4,7 +4,7 @@ PRAGMA foreign_keys = ON;
 -- Full card JSON lives in `data`; hot fields are copied out for querying.
 CREATE TABLE IF NOT EXISTS cards (
   id          INTEGER PRIMARY KEY,
-  card_type   TEXT NOT NULL CHECK (card_type IN ('poster', 'post', 'terminal')),
+  card_type   TEXT NOT NULL CHECK (card_type IN ('poster', 'post', 'terminal', 'article')),
   topic       TEXT NOT NULL CHECK (topic IN ('networking', 'security', 'ai', 'swe', 'ios')),
   series_id   TEXT,
   part        INTEGER,
@@ -24,6 +24,15 @@ CREATE TABLE IF NOT EXISTS sources (
   url       TEXT NOT NULL,
   feed      TEXT NOT NULL,
   fetched_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
+
+-- Reader view of a card's article (GET /cards/{id}/reader); only successful extractions.
+CREATE TABLE IF NOT EXISTS readers (
+  card_id     INTEGER PRIMARY KEY REFERENCES cards(id),
+  title       TEXT,
+  url         TEXT NOT NULL,
+  text        TEXT NOT NULL,
+  fetched_at  TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
 
 -- Curriculum progress: next roadmap item per topic.
