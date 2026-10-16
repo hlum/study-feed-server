@@ -151,6 +151,19 @@ DB_PATH=/tmp/t.db FAKE_NOW=2026-10-16T09:00:00 .venv/bin/uvicorn app:app --host 
 curl -s http://127.0.0.1:18002/review
 ```
 
+## Tests
+
+```sh
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+`tests/test_quiz.py` covers `POST /cards/{id}/quiz`:
+- Japanese articles get a Japanese quiz, and an English reply for one is rejected.
+- Duplicate options are rejected.
+- A saved quiz is returned without a call.
+
+Claude and the page fetch are stubbed, and the tests use a throwaway database, so they make no calls and never touch `study.db`.
+
 ## Design notes
 
 - **Feed:** `/feed` returns every card, newest first, seen or not, each with `seen`. Due reviews are mixed in. `?unseen_only=true` gives the old unseen-only feed.
